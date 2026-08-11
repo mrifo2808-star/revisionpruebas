@@ -163,16 +163,99 @@ def _omr_encontrar_barra_encabezado(gray):
     return header_bottom
 
 
+def _omr_contar_picos_locales(hist, min_valor):
+    """Cuenta máximos locales en un histograma 1D (bins consecutivos): un bin
+    es un pico si es >= a ambos vecinos y supera `min_valor`. A diferencia de
+    "contar corridas de bins por encima de un piso", esto SÍ separa filas
+    reales adyacentes aunque el valle entre ellas no baje hasta un piso fijo
+    -- una fila real de burbujas contra otra puede compartir un valle de
+    conteo moderado (no cero) por el solapamiento de detecciones Hough
+    vecinas, y una corrida-por-piso las fusiona en una sola "fila" (bug real:
+    una franja con 6 filas reales de burbujas medía solo 1-3 corridas con esa
+    lógica, según el piso elegido, mientras que con máximos locales mide 5-6,
+    coincidiendo con las filas reales visibles en la foto)."""
+    n = len(hist)
+    picos = []
+    for i in range(n):
+        if hist[i] < min_valor:
+            continue
+        if (i == 0 or hist[i] >= hist[i - 1]) and (i == n - 1 or hist[i] >= hist[i + 1]):
+            picos.append(i)
+    fusionados = []
+    for p in picos:
+        if fusionados and p - fusionados[-1] <= 1:
+            continue
+        fusionados.append(p)
+    return len(fusionados)
+
+
+def _omr_header_seguido_de_grilla(warp_gray, header_bottom, min_filas_densas=4, min_conteo_pico=3):
+    """
+    Verifica que la franja de contenido INMEDIATAMENTE debajo del header
+    detectado sea realmente el cuerpo de burbujas de RESPUESTAS, no otra
+    sección de la hoja que también tenga su propia barra oscura y sólida
+    real. `_omr_encontrar_barra_encabezado` solo confirma que existe ALGUNA
+    barra -- no distingue "RESPUESTAS" de "IDENTIFICACIÓN DEL ESTUDIANTE"
+    (sin OCR no puede). Encontrado con smoke test real: cuando el contorno
+    del candidato fusiona/aísla la sección de identificación en vez de
+    RESPUESTAS, la barra "IDENTIFICACIÓN DEL ESTUDIANTE" -- real, sólida --
+    pasaba el check en vez de la barra "RESPUESTAS" real, y el resto del
+    pipeline terminaba leyendo casillas de nombre/folleto como si fueran
+    burbujas de respuesta.
+
+    Ni contar círculos Hough en la franja, ni exigir columnas parejas, ni
+    clusterizar filas por simple espaciado de gaps alcanza por sí solo:
+    letras manuscritas y bordes de casillas de texto también producen
+    "círculos" Hough y hasta clusters de columna/fila con spacing parecido
+    (probado sobre fotos reales) -- y un candidato de identificación con
+    varias filas de casillero (apellido paterno/materno/nombres) puede
+    incluso producir 1-2 "filas" de ruido agrupado, aunque nunca tantas como
+    una tabla real. La señal que sí separa ambos casos con margen amplio
+    (~5 filas reales vs. ~2 como máximo de ruido, medido sobre fotos reales)
+    es la DENSIDAD DE FILAS: una tabla RESPUESTAS empaqueta ~20 filas de
+    burbujas en el espacio que una sola fila de un casillero de texto ocupa
+    para sí sola. Se cuenta como histograma de densidad (no clustering por
+    gaps, que el ruido disperso entre filas reales puede puentear sin dejar
+    un hueco limpio) cuántas "filas" (bins consecutivos con >= min_conteo_pico
+    círculos) hay dentro de una franja de altura fija relativa al ANCHO del
+    candidato (más estable que relativa a su alto, que es justamente lo que
+    puede estar inflado o recortado por una fusión/aislamiento de secciones)."""
+    h_total, w_total = warp_gray.shape
+    alto_franja = max(15, int(w_total * 0.18))
+    y0, y1 = header_bottom, min(h_total, header_bottom + alto_franja)
+    if y1 - y0 < 8:
+        return False
+    franja = warp_gray[y0:y1, :]
+    franja_det, _ = _omr_escalar_para_deteccion(franja, OMR_ANCHO_REF_TABLA)
+    blur = cv2.medianBlur(franja_det, 3)
+    ww = franja_det.shape[1]
+    r_guess = max(3, ww // 60)
+    circles = cv2.HoughCircles(
+        blur, cv2.HOUGH_GRADIENT, dp=1, minDist=max(4, r_guess),
+        param1=60, param2=14, minRadius=max(2, int(r_guess * 0.5)),
+        maxRadius=int(r_guess * 2.2),
+    )
+    if circles is None:
+        return False
+    ys = circles[0][:, 1]
+    ancho_bin = max(2.0, r_guess * 0.5)
+    bins = np.arange(0, franja_det.shape[0] + ancho_bin, ancho_bin)
+    hist, _ = np.histogram(ys, bins=bins)
+    return _omr_contar_picos_locales(hist, min_conteo_pico) >= min_filas_densas
+
+
 def _omr_candidato_tiene_header(gray, rect):
     """
     Verifica que la parte superior del candidato tenga una barra de
     encabezado oscura y sólida real -- como la barra "RESPUESTAS" impresa en
-    la plantilla. Distingue el bloque RESPUESTAS real de un contorno que, por
-    poca luz o una sombra, terminó fusionado con contenido vecino en la misma
-    hoja (p.ej. el texto "USO EXCLUSIVO PARA ENSAYOS DE PRUEBAS" impreso al
-    lado de la tabla en esta plantilla) -- encontrado con un caso real donde
-    ese texto vecino terminaba "dentro" del bloque detectado y las preguntas
-    de las últimas columnas se leían sobre ese texto en vez de sobre burbujas.
+    la plantilla -- E INMEDIATAMENTE debajo de ella haya evidencia real de
+    burbujas (ver _omr_header_seguido_de_grilla). Distingue el bloque
+    RESPUESTAS real de un contorno que, por poca luz o una sombra, terminó
+    fusionado con contenido vecino en la misma hoja (p.ej. el texto "USO
+    EXCLUSIVO PARA ENSAYOS DE PRUEBAS" impreso al lado de la tabla, o la
+    sección "IDENTIFICACIÓN DEL ESTUDIANTE" fusionada por encima) -- ambos
+    casos encontrados con fotos reales donde el bloque detectado terminaba
+    leyendo texto/casillas vecinas en vez de burbujas de respuesta.
     """
     box = cv2.boxPoints(rect).astype("float32")
     src = _omr_ordenar_puntos(box)
@@ -183,10 +266,13 @@ def _omr_candidato_tiene_header(gray, rect):
     dst = np.array([[0, 0], [w_ - 1, 0], [w_ - 1, h_ - 1], [0, h_ - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(src, dst)
     warp = cv2.warpPerspective(gray, M, (w_, h_))
-    return _omr_encontrar_barra_encabezado(warp) > 0
+    header_bottom = _omr_encontrar_barra_encabezado(warp)
+    if header_bottom <= 0:
+        return False
+    return _omr_header_seguido_de_grilla(warp, header_bottom)
 
 
-def _omr_candidato_evidencia_grilla(gray, rect, min_circulos=80):
+def _omr_candidato_evidencia_grilla(gray, rect, min_circulos=80, min_filas_densas=15, min_conteo_pico=3):
     """
     Evidencia geométrica INDEPENDIENTE del header: ¿el candidato realmente
     contiene un patrón denso y repetitivo de burbujas (círculos chicos), o es
@@ -199,8 +285,17 @@ def _omr_candidato_evidencia_grilla(gray, rect, min_circulos=80):
     min_circulos=80 es un piso bajo a propósito (una tabla real de 1-4
     columnas x 20 filas x 5 alternativas tiene entre 100 y 400 burbujas) --
     solo busca descartar candidatos que casi no tienen círculos reales
-    (texto, ruido de compresión), no exigir una cuenta exacta.
-    """
+    (texto, ruido de compresión), no exigir una cuenta exacta. PERO no
+    alcanza por sí solo: la grilla de dígitos "CÉDULA DE IDENTIDAD"/
+    "PASAPORTE" de esta misma plantilla también es un patrón denso y
+    repetitivo de círculos reales (encontrado en smoke test real: 107
+    círculos, sobre el piso de 80) -- es una grilla real, solo que la
+    incorrecta. La distingue su NÚMERO DE FILAS: CÉDULA tiene ~10-11 filas
+    (dígitos 0-9, +K), RESPUESTAS tiene hasta 20 por banda -- se exige
+    encontrar al menos `min_filas_densas` filas densas de círculos en el
+    candidato completo (mismo método de histograma de densidad que
+    `_omr_header_seguido_de_grilla`, reutilizado acá sobre todo el
+    candidato en vez de solo la franja bajo el header)."""
     box = cv2.boxPoints(rect).astype("float32")
     src = _omr_ordenar_puntos(box)
     w_ = int(max(np.linalg.norm(src[1] - src[0]), np.linalg.norm(src[2] - src[3])))
@@ -219,8 +314,13 @@ def _omr_candidato_evidencia_grilla(gray, rect, min_circulos=80):
         param1=60, param2=14, minRadius=max(2, int(r_guess * 0.5)),
         maxRadius=int(r_guess * 2.2),
     )
-    n_circulos = 0 if circles is None else circles.shape[1]
-    return n_circulos >= min_circulos
+    if circles is None or circles.shape[1] < min_circulos:
+        return False
+    ys = circles[0][:, 1]
+    ancho_bin = max(2.0, r_guess * 0.5)
+    bins = np.arange(0, warp_det.shape[0] + ancho_bin, ancho_bin)
+    hist, _ = np.histogram(ys, bins=bins)
+    return _omr_contar_picos_locales(hist, min_conteo_pico) >= min_filas_densas
 
 
 def omr_detectar_bloque_respuestas(img_bgr):
@@ -236,7 +336,16 @@ def omr_detectar_bloque_respuestas(img_bgr):
     th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY_INV, 35, 15)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # iterations=1 (antes 2): con 2 iteraciones el alcance efectivo del cierre
+    # (~16-18px a esta escala de referencia) puentea el hueco real entre
+    # secciones DISTINTAS de la hoja (medido en una foto real: 13-14px entre
+    # "IDENTIFICACIÓN DEL ESTUDIANTE"/"N° DE FOLLETO"/"RESPUESTAS", contra
+    # 2-6px de hueco DENTRO de una misma sección) -- fusionaba identificación
+    # + folleto + RESPUESTAS en un solo contorno gigante, y el bloque
+    # "detectado" terminaba siendo casi toda la página. 1 iteración sigue
+    # cerrando los huecos internos de una sección (más chicos) sin puentear
+    # el hueco real entre secciones distintas.
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
     candidatos = []
@@ -252,12 +361,23 @@ def omr_detectar_bloque_respuestas(img_bgr):
         fill = area / (rw * rh)
         long_side, short_side = max(rw, rh), min(rw, rh)
         aspect = long_side / max(short_side, 1e-6)
-        # el bloque RESPUESTAS es sólido (fill alto) y moderadamente apaisado
-        # (4 columnas una al lado de otra); evita capturar la hoja entera o
-        # cajas chicas de cédula/ID. Umbrales deliberadamente permisivos
-        # (calibrados sobre pocas fotos reales): mejor aceptar de más que
-        # rechazar la tabla real por una foto con encuadre distinto.
-        if fill > 0.45 and 0.9 < aspect < 3.2 and area < page_area * 0.75:
+        # el bloque RESPUESTAS es moderadamente apaisado (4 columnas una al
+        # lado de otra); evita capturar la hoja entera o cajas chicas de
+        # cédula/ID. Umbrales deliberadamente permisivos (calibrados sobre
+        # pocas fotos reales): mejor aceptar de más que rechazar la tabla
+        # real por una foto con encuadre distinto.
+        #
+        # fill>0.15 (antes 0.45): una tabla real de 20 filas x hasta 4
+        # bandas tiene MUCHO espacio en blanco entre filas/columnas -- medido
+        # en una foto real donde el bloque RESPUESTAS correcto, limpio y
+        # bien aislado (confirmado visualmente) media fill=0.21, muy por
+        # debajo del piso anterior. Ese piso alto no protegía contra nada
+        # real (el bloque de texto denso sintético que sí debe rechazarse
+        # mide fill=0.73, muy por encima) -- la protección real contra texto
+        # viene de _omr_candidato_tiene_header / _omr_candidato_evidencia_grilla
+        # (exigen barra de encabezado + densidad de filas de círculos reales),
+        # no del fill ratio.
+        if fill > 0.15 and 0.9 < aspect < 3.2 and area < page_area * 0.75:
             candidatos.append((area, rect))
     if not candidatos:
         return None
@@ -1469,7 +1589,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "4.0.1"
+VERSION_APP = "4.0.2"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 # Motor OMR v4: geometry_confidence + geometry_state (OK/WARNING/ERROR) +
@@ -1493,7 +1613,26 @@ DESARROLLADO_POR = "Matías Rifo V."
 # OFF por defecto (NUMBER_LATTICE_CROSSCHECK_HABILITADO=False) tras medir un
 # falso positivo en la foto de calibración real -- no se habilita un gate
 # adicional sin evidencia de que no introduce más riesgo del que evita.
-OMR_ENGINE_VERSION = "4.1.0"
+#
+# v4.1.1 (UBICACIÓN DE TABLA): causa raíz encontrada más arriba en el
+# pipeline que el row lattice -- `omr_detectar_bloque_respuestas` podía
+# fusionar la sección RESPUESTAS con secciones vecinas (identificación del
+# alumno, N° de folleto) vía un cierre morfológico demasiado permisivo
+# (iterations=2 → iterations=1), y aunque las secciones quedaran separadas,
+# `_omr_candidato_tiene_header` solo confirmaba "hay una barra oscura
+# arriba" sin distinguir la barra real "RESPUESTAS" de otras barras reales
+# de la misma hoja (identificación, CÉDULA DE IDENTIDAD -- esta última una
+# grilla de círculos real también, así que ni el conteo crudo de círculos
+# alcanzaba). Corregido exigiendo densidad de filas reales inmediatamente
+# bajo el header (`_omr_header_seguido_de_grilla`) y en el candidato
+# completo (`_omr_candidato_evidencia_grilla`), con conteo de picos por
+# máximos locales (`_omr_contar_picos_locales`) en vez de corridas sobre un
+# piso fijo (que fusionaba filas reales adyacentes cuando el valle entre
+# ellas no llegaba a cero). Validado contra 3 fotos reales privadas
+# (fuera del repo): pasaron de leer casillas de nombre/cédula como si
+# fueran respuestas -- o fallar por completo -- a leer las 80 preguntas
+# con geometry_confidence 0.77-1.00 en la gran mayoría de bandas.
+OMR_ENGINE_VERSION = "4.1.1"
 
 st.markdown("""
 <style>
