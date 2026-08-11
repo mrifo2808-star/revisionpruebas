@@ -95,7 +95,7 @@ foto completa (imagen 1) es solo de referencia general y para los datos de ident
     else:
         nota_imagenes = ""
 
-    return f"""{nota_imagenes}Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
+    return f"""{nota_imagenes}Eres un experto en leer hojas de respuestas de alternativas (A/B/C/D/E) de estudiantes chilenos.
 Todas las hojas que vas a revisar usan siempre la misma plantilla fija "PLANTILLA DE HOJA DE RESPUESTAS", con
 esta estructura exacta:
 
@@ -111,6 +111,17 @@ esta estructura exacta:
   otra de izquierda a derecha: {descripcion_columnas}. Dentro de cada columna, cada fila tiene el número de
   pregunta impreso a la izquierda seguido de 5 burbujas A-E.
 
+CÓMO ESTÁ MARCADA ESTA HOJA:
+Cada pregunta tiene 5 círculos impresos que dicen A, B, C, D, E. El estudiante marca su respuesta rellenando o
+rayando con lápiz mina el círculo elegido. El círculo marcado se ve MÁS OSCURO, GRIS o RELLENO comparado con
+los otros 4 de la misma fila, que quedan vacíos/blancos con solo la letra impresa adentro.
+
+REGLA DE ORO para leer cada fila: para CADA fila de 5 burbujas, compara las 5 ENTRE SÍ y elige la que se vea
+más oscura, gris o rellena respecto a sus vecinas de esa misma fila — no evalúes cada burbuja aislada ni le
+pidas que esté "perfectamente" rellena. Incluso en una imagen borrosa o de baja resolución, el círculo marcado
+casi siempre tiene visiblemente más tono gris que los vacíos de su misma fila; esa diferencia relativa dentro
+de la fila es más confiable que juzgar una sola burbuja por sí sola.
+
 PASO 1 — Usa el número IMPRESO de cada fila, nunca el orden espacial en que la vas mirando. Por ejemplo, la
 fila que dice "21" al lado de las burbujas es la pregunta 21 sin importar en qué columna esté ni si la miraste
 antes o después que la fila "5" — no asumas que "la siguiente fila hacia abajo" continúa la numeración de la
@@ -121,25 +132,17 @@ impreso (posición 1 = pregunta "1", posición 21 = pregunta "21", etc.), recorr
 
 PASO 3 — Antes de responder, verifica que el arreglo "respuestas" tenga exactamente {n} elementos, uno por
 cada número de pregunta impreso del 1 al {n} sin saltos ni desplazamientos. Luego vuelve a mirar por segunda
-vez SOLO las preguntas donde no quedaste 100% seguro de cuál opción marcó el estudiante, y confírmalas con
-calma.
+vez, aplicando otra vez la REGLA DE ORO, SOLO las preguntas donde no quedaste 100% seguro de cuál opción
+marcó el estudiante, y confírmalas con calma.
 
-Criterio simple para "dudosas" — marca una pregunta como dudosa ÚNICAMENTE si, tras esa segunda mirada, sigue
-existiendo un riesgo real de haber leído mal la intención del estudiante (ejemplos: dos opciones con marca
-igual de oscura, un borrón que deja la burbuja ambigua entre dos letras, o una marca tan tenue que pudo no
-ser intencional). Si el trazo es imperfecto o desprolijo pero al mirarlo con calma se entiende con claridad
-cuál opción eligió el estudiante, NO es una pregunta dudosa — entrégala como respuesta normal, sin marcarla.
-
-Advertencia importante sobre resolución: como hay {n} preguntas × 5 burbujas en una sola imagen, algunas filas
-pueden verse muy pequeñas o borrosas. NUNCA elijas una opción al azar solo porque "alguna" debe ser la
-respuesta — si de verdad no puedes distinguir con confianza cuál de las 5 burbujas de una fila está marcada
-(o si no puedes distinguir si hay o no una marca), es preferible responder null y agregar esa pregunta a
-"dudosas", en vez de adivinar una letra. Adivinar en silencio es el peor resultado posible: se ve como una
-respuesta correcta pero puede ser falsa. Antes de dar cualquier letra, confirma que realmente ves esa burbuja
-específica más oscura o marcada que las otras 4 de su misma fila.
-
-El objetivo es que "dudosas" quede lo más corta posible y contenga solo los casos con riesgo real de error;
-todo lo demás se da por bueno sin necesitar revisión humana.
+CUÁNDO usar null y marcar como "dudosa" (mantén esta lista lo más corta posible): únicamente cuando, al
+comparar las 5 burbujas de una fila entre sí, las 5 se ven igual de vacías (pregunta omitida) o dos se ven
+igual de oscuras/rellenas entre sí (ambigüedad real, no se puede distinguir cuál de las dos es la marca). Si
+una burbuja es claramente la más oscura de su fila aunque sea levemente, ESA es la respuesta — no es dudosa,
+y no la dejes en null. Nunca elijas una letra al azar "porque alguna debe ser": si tras aplicar la REGLA DE
+ORO dos veces sigues sin poder distinguir cuál de las 5 está marcada, usa null y agrégala a "dudosas" en vez
+de adivinar — adivinar en silencio es peor que un dudoso, porque se ve como una respuesta correcta pero puede
+ser falsa.
 
 Responde ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown, con esta forma exacta:
 
@@ -195,8 +198,9 @@ def preparar_imagenes(datos_bytes: bytes, mime: str):
     reparte entre las 80 y cada burbuja queda en unos pocos píxeles — insuficiente
     para distinguir con fiabilidad el rayado a lápiz. Por eso se generan 3 versiones
     de la misma foto: completa (para identificación del alumno) y dos acercamientos
-    —mitad izquierda / mitad derecha, con superposición— que le dan a cada mitad del
-    bloque RESPUESTAS su propio techo de resolución completo.
+    —mitad izquierda / mitad derecha, recortando además el 10% superior donde no hay
+    burbujas— que le dan a cada mitad del bloque RESPUESTAS su propio techo de
+    resolución completo.
     """
     try:
         img = Image.open(io.BytesIO(datos_bytes))
@@ -205,13 +209,21 @@ def preparar_imagenes(datos_bytes: bytes, mime: str):
         return [(base64.standard_b64encode(datos_bytes).decode(), mime)]
     w, h = img.size
     completa = _img_a_b64_jpeg(img, 1568, 90)
-    margen = 0.08  # superposición para no cortar una columna justo por la mitad
-    izq = img.crop((0, 0, int(w * (0.5 + margen)), h))
-    der = img.crop((int(w * (0.5 - margen)), 0, w, h))
+
+    # Recorte vertical conservador: en esta plantilla la identificación del alumno
+    # siempre ocupa bastante más del 10% superior de la hoja, así que descartar solo
+    # ese 10% en los acercamientos no arriesga cortar filas de RESPUESTAS aunque la
+    # foto venga encuadrada de forma distinta cada vez.
+    top = int(h * 0.10)
+    margen = 0.10  # superposición horizontal para no cortar una columna justo por la mitad
+    mitad = w // 2
+    overlap = int(w * margen)
+    izq = img.crop((0, top, min(w, mitad + overlap), h))
+    der = img.crop((max(0, mitad - overlap), top, w, h))
     return [
         (completa, "image/jpeg"),
-        (_img_a_b64_jpeg(izq, 1568, 90), "image/jpeg"),
-        (_img_a_b64_jpeg(der, 1568, 90), "image/jpeg"),
+        (_img_a_b64_jpeg(izq, 1568, 92), "image/jpeg"),
+        (_img_a_b64_jpeg(der, 1568, 92), "image/jpeg"),
     ]
 
 def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
@@ -221,7 +233,7 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int)
         for data, mt in imagenes
     ]
     msg = cliente.messages.create(
-        model="claude-sonnet-5", max_tokens=4096,
+        model="claude-sonnet-5", max_tokens=6144,
         messages=[{"role":"user","content": bloques_imagen + [
             {"type":"text","text":prompt_dinamico(n, len(imagenes))},
         ]}],
@@ -621,7 +633,7 @@ with tab_cargar:
         if not key:
             st.error("Ingresa tu API Key en el panel lateral.")
         elif st.button(f"🚀 Procesar {len(pendientes)} hoja(s)", type="primary", use_container_width=True):
-            cliente = anthropic.Anthropic(api_key=key, timeout=60.0, max_retries=1)
+            cliente = anthropic.Anthropic(api_key=key, timeout=90.0, max_retries=1)
             prog = st.progress(0, text="Iniciando...")
             errs = []
             items = list(pendientes.items())
