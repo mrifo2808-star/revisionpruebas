@@ -16,6 +16,7 @@ import qrcode
 import pandas as pd
 import streamlit as st
 import anthropic
+import registro_sheets
 from PIL import Image, ImageEnhance, ImageOps
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1582,9 +1583,21 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
 # ═══════════════════════ fin motor OMR ═══════════════════════════════════
 
 
-VERSION_APP = "4.1.0"
+VERSION_APP = "4.2.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
+# v4.2.0 (LOGIN + REGISTRO DE ACTIVIDAD): la plataforma pasa a requerir
+# inicio de sesión -- grupo cerrado de cuentas precargadas por el
+# administrador (ver gestionar_usuarios.py), sin auto-registro público. Cada
+# login y cada exportación de Excel quedan respaldados en una hoja de
+# cálculo externa (registro_sheets.py) -- SOLO METADATOS (usuario, curso,
+# cantidad de hojas, contadores de confiables/dudosas): nunca nombres, RUT
+# ni respuestas de estudiantes, que siguen viviendo únicamente en el Excel
+# que el propio docente descarga. Streamlit Community Cloud no garantiza
+# persistir archivos locales entre reinicios del contenedor, así que el
+# respaldo vive fuera de la app, en Google Sheets, vía una cuenta de
+# servicio (credenciales en st.secrets, nunca en el repo). Motor OMR sin
+# cambios (OMR_ENGINE_VERSION se mantiene).
 # v4.1.0 (PLATAFORMA): el sitio deja de ser un script de una sola pantalla y
 # pasa a ser un router multipágina (st.navigation/st.Page) con una página de
 # inicio "Herramientas Docentes" -- el Revisor de Hojas de Respuestas queda
@@ -3124,6 +3137,14 @@ def render_revisor_pruebas():
                 file_name=nombre_xl,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary", use_container_width=True,
+                # Respaldo de actividad (solo metadatos -- nunca nombres/RUT/
+                # respuestas de alumnos, ver registro_sheets.py): se registra
+                # justo cuando se entrega el resultado real, no antes.
+                on_click=registro_sheets.registrar_evento,
+                args=(st.session_state["auth_usuario"]["usuario"], "export_excel"),
+                kwargs=dict(curso=curso, n_preguntas=total_p, n_alumnos=len(st.session_state.resultados),
+                            dudas_pendientes=pend_exp, sospechosas=sospechosas_exp,
+                            sin_identificar=sin_id_exp, omr_engine_version=OMR_ENGINE_VERSION),
             )
             st.caption("El Excel incluye Resumen, Detalle de respuestas, Estadísticas y Pauta utilizada — "
                        "la columna **Curso** en Resumen permite unir varios exports en un archivo maestro.")
@@ -3170,6 +3191,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _render_login():
+    """Formulario de acceso -- grupo cerrado, cuentas precargadas por el
+    administrador (ver gestionar_usuarios.py); no hay auto-registro. Bloquea
+    TODA la plataforma (Inicio y cualquier herramienta) hasta iniciar
+    sesión con una cuenta válida y activa."""
+    st.markdown("# 🎓 Herramientas Docentes")
+    st.caption("Acceso restringido — ingresa con tu cuenta.")
+    with st.form("form_login"):
+        usuario = st.text_input("Usuario")
+        password = st.text_input("Clave", type="password")
+        enviado = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
+    if enviado:
+        datos = registro_sheets.verificar_login(usuario, password)
+        if datos:
+            st.session_state["auth_usuario"] = datos
+            registro_sheets.registrar_evento(datos["usuario"], "login")
+            st.rerun()
+        else:
+            st.error("Usuario o clave incorrectos.")
+
+
+if not st.session_state.get("auth_usuario"):
+    _render_login()
+    st.stop()
+
+with st.sidebar:
+    _auth = st.session_state["auth_usuario"]
+    st.markdown(f"👤 **{_auth['nombre']}**")
+    if st.button("Cerrar sesión", use_container_width=True):
+        del st.session_state["auth_usuario"]
+        st.rerun()
+    st.markdown("---")
 
 pagina_inicio = st.Page(render_inicio, title="Inicio", icon="🏠", default=True, url_path="inicio")
 pagina_revisor = st.Page(render_revisor_pruebas, title="Revisor de Pruebas", icon="📝",
