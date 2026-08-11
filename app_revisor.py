@@ -40,6 +40,30 @@ div[data-testid="stFileUploader"] > div { min-height: 120px; }
 </style>
 """, unsafe_allow_html=True)
 
+# ─── Acceso restringido por código ──────────────────────────────────
+def verificar_acceso() -> bool:
+    try:
+        codigo_secreto = st.secrets.get("APP_ACCESS_CODE", "")
+    except Exception:
+        codigo_secreto = ""
+    if not codigo_secreto:
+        return True
+    if st.session_state.get("autenticado"):
+        return True
+    st.markdown("## 🔒 Acceso restringido")
+    st.caption("Ingresa el código que te enviaron para usar esta app.")
+    codigo = st.text_input("Código de acceso", type="password", key="codigo_acceso")
+    if st.button("Ingresar", type="primary"):
+        if codigo == codigo_secreto:
+            st.session_state["autenticado"] = True
+            st.rerun()
+        else:
+            st.error("Código incorrecto.")
+    return False
+
+if not verificar_acceso():
+    st.stop()
+
 # ─── Estado de sesión ────────────────────────────────────────────────
 def df_pauta_vacio(n: int) -> pd.DataFrame:
     return pd.DataFrame({
