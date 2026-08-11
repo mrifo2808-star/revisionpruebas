@@ -405,7 +405,7 @@ with tab_pauta:
             column_config={
                 "N°": st.column_config.TextColumn("N°", disabled=True, width="small"),
                 "Respuesta": st.column_config.SelectboxColumn(
-                    "Respuesta", options=["A","B","C","D","E"], width="small", required=False),
+                    "Respuesta", options=["","A","B","C","D","E"], width="small", required=False),
             },
             hide_index=True, height=min(38*n+40, 560),
             use_container_width=True, key="editor_pauta",
