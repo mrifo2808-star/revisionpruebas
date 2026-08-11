@@ -23,14 +23,445 @@ from openpyxl.utils import get_column_letter
 
 # Motor OMR (opcional): si opencv/numpy no están disponibles en el entorno de
 # despliegue, la app sigue funcionando 100% igual que antes con el flujo solo-IA
-# — el modo OMR simplemente no aparece como opción en el sidebar.
+# — el modo OMR simplemente no aparece como opción en el sidebar. El motor va
+# inline en este mismo archivo (no en un módulo omr.py aparte) a propósito:
+# tener dos archivos abrió la puerta, más de una vez en producción, a que
+# Streamlit Cloud sirviera una combinación inconsistente de ambos durante un
+# redeploy (un archivo ya actualizado, el otro todavía en la versión previa),
+# produciendo errores confusos que dependían de qué mitad del código corriera
+# en ese momento. Con un solo archivo esa clase de bug deja de ser posible.
 try:
     import numpy as np
     import cv2
-    import omr
     OMR_DISPONIBLE = True
 except Exception:
     OMR_DISPONIBLE = False
+
+# ═══════════════════════════════════════════════════════════════════════
+# MOTOR OMR (Optical Mark Recognition) — plantilla "PLANTILLA DE HOJA DE
+# RESPUESTAS". Detecta automáticamente qué alternativa (A-E) marcó el
+# estudiante en cada fila de la tabla RESPUESTAS. Este motor es la ÚNICA
+# fuente de las respuestas: Claude Vision nunca lee ni confirma burbujas (la
+# app la usa solo para transcribir nombre/RUT de la cabecera, tarea aparte).
+# Las preguntas que el motor no logra determinar con confianza quedan como
+# "dudosas" para revisión manual en la app — ninguna IA adivina ni corrige
+# una lectura de burbujas.
+#
+# Diseño: en vez de coordenadas de píxel fijas (frágil ante fotos de celular
+# con ángulos/distancias distintas), todo se deriva de la propia imagen:
+#   1. localizar el bloque RESPUESTAS (umbral adaptativo + contornos) solo si
+#      la imagen es la hoja completa; si ya viene recortada se usa entera;
+#   2. si se localizó, enderezarlo con una transformación de perspectiva;
+#   3. ubicar la barra de encabezado y las bandas de columnas (1-4) por
+#      proyección de tinta, probando varios umbrales de sensibilidad; si
+#      ninguno distingue suficientes huecos reales entre columnas (foto
+#      borrosa/comprimida) Y la región ya fue validada como la tabla
+#      completa, se reparte el ancho de contenido en partes iguales en vez
+#      de fallar — nunca se reescala ni comprime la imagen, solo cambia
+#      dónde se traza el límite de cada columna. En un recorte sin validar
+#      (subido directo por el usuario), ante la duda se prefiere fallar
+#      claro antes que fabricar una columna que no existe;
+#   4. ajustar, POR BANDA POR SEPARADO, una grilla de 20 filas x 5 columnas
+#      (Hough circles + kmeans 1D) — las filas no se comparten entre bandas
+#      a propósito, para que un corrimiento en una columna no contamine a
+#      las demás (encontrado con verificación manual sobre fotos reales);
+#   5. medir cuánto más oscura está cada burbuja que el papel en blanco,
+#      comparando SIEMPRE dentro de la misma fila, con baseline/peak
+#      calculados POR BANDA (no globales) para tolerar iluminación despareja.
+# ═══════════════════════════════════════════════════════════════════════
+
+OMR_THRESHOLDS = {
+    "MIN_MARK_SCORE": 0.25,          # confianza mínima para considerar que SÍ hay una marca real
+    "AMBIGUOUS_MARGIN": 0.15,        # margen mínimo entre 1ª y 2ª alternativa para no ser ambiguo/empate
+    "HIGH_CONFIDENCE_MARGIN": 0.30,  # margen a partir del cual se usa directo, sin marcar dudosa
+    "DOUBLE_MARK_THRESHOLD": 0.55,   # si dos alternativas superan esto, se considera "doble marca"
+    "BLANK_REVIEW_MARGIN": 0.12,     # "sin_marca" por encima de esto = posible marca débil, queda dudosa
+}
+OMR_N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
+OMR_LETRAS = ["A", "B", "C", "D", "E"]
+
+
+class OMRError(Exception):
+    """Fallo irrecuperable de una etapa del pipeline OMR — la hoja queda sin
+    resolver para completar a mano (nunca se reemplaza con una lectura de IA)."""
+
+
+def omr_detectar_bloque_respuestas(img_bgr):
+    """
+    Devuelve los 4 puntos (rotados, en cualquier orden) del rectángulo que
+    contiene la tabla RESPUESTAS dentro de una foto de la hoja completa, o
+    None si no se encuentra con confianza suficiente (la hoja completa tiene
+    además los bloques de identificación/cédula, más chicos y con menor
+    fill_ratio que el bloque RESPUESTAS, el mayor recuadro "sólido" del diseño).
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 35, 15)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    best, best_area = None, -1
+    page_area = h * w
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < page_area * 0.03:
+            continue
+        rect = cv2.minAreaRect(c)
+        (_, _), (rw, rh), _ = rect
+        if rw < 1 or rh < 1:
+            continue
+        fill = area / (rw * rh)
+        long_side, short_side = max(rw, rh), min(rw, rh)
+        aspect = long_side / max(short_side, 1e-6)
+        # el bloque RESPUESTAS es sólido (fill alto) y moderadamente apaisado
+        # (4 columnas una al lado de otra); evita capturar la hoja entera o
+        # cajas chicas de cédula/ID. Umbrales deliberadamente permisivos
+        # (calibrados sobre pocas fotos reales): mejor aceptar de más que
+        # rechazar la tabla real por una foto con encuadre distinto.
+        if fill > 0.45 and 0.9 < aspect < 3.2 and area < page_area * 0.75:
+            if area > best_area:
+                best_area, best = area, rect
+    if best is None:
+        return None
+    return cv2.boxPoints(best)
+
+
+def _omr_ordenar_puntos(pts):
+    pts = np.array(pts)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).flatten()
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(d)]
+    bl = pts[np.argmax(d)]
+    return np.array([tl, tr, br, bl], dtype="float32")
+
+
+def omr_enderezar_region(img_bgr, quad):
+    """Perspective-warp de un cuadrilátero (4 puntos, cualquier orden/rotación) a un rectángulo recto."""
+    src = _omr_ordenar_puntos(quad)
+    w_top = np.linalg.norm(src[1] - src[0])
+    w_bot = np.linalg.norm(src[2] - src[3])
+    h_left = np.linalg.norm(src[3] - src[0])
+    h_right = np.linalg.norm(src[2] - src[1])
+    out_w = int(max(w_top, w_bot))
+    out_h = int(max(h_left, h_right))
+    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img_bgr, M, (out_w, out_h))
+
+
+def _omr_bandas_por_gaps(col_smooth, bw, umbral):
+    mask = col_smooth > umbral
+    bands = []
+    in_band, start = False, 0
+    for x in range(bw):
+        if mask[x] and not in_band:
+            in_band, start = True, x
+        elif not mask[x] and in_band:
+            in_band = False
+            bands.append((start, x))
+    if in_band:
+        bands.append((start, bw))
+    bands = [b for b in bands if (b[1] - b[0]) > bw * 0.04]
+    return bands, mask
+
+
+def omr_detectar_header_y_bandas(gray, max_bandas=4, bandas_esperadas=None, permitir_reparto_geometrico=True):
+    """
+    Devuelve (header_bottom, bandas) donde bandas es una lista de (x0,x1) — una
+    por cada bloque de 20 preguntas visible en la imagen (1 a 4). header_bottom=0
+    si no se detecta una barra de encabezado sólida (imagen ya recortada que
+    empieza directo en la fila 1).
+
+    `permitir_reparto_geometrico`: si los huecos reales entre columnas no se
+    distinguen con ningún umbral, repartir el ancho de contenido en partes
+    iguales asume que el contenido visible SÍ contiene las `bandas_esperadas`
+    columnas completas. Razonable cuando la región ya fue validada como la
+    tabla RESPUESTAS completa; peligroso en un recorte sin validar que
+    genuinamente no muestre todas las columnas (fabricaría una columna
+    inexistente y devolvería respuestas con confianza alta pero incorrectas).
+    """
+    h, w = gray.shape
+    row_mean = gray.mean(axis=1)
+    dark_rows = row_mean < (row_mean.mean() - row_mean.std() * 0.5)
+    header_bottom = 0
+    in_run, run_start = False, 0
+    for y in range(min(h, int(h * 0.25))):
+        if dark_rows[y] and not in_run:
+            in_run, run_start = True, y
+        elif not dark_rows[y] and in_run:
+            in_run = False
+            if (y - run_start) > h * 0.015:
+                header_bottom = y
+    body = gray[header_bottom:h, :]
+    bh, bw = body.shape
+
+    col_ink = 255 - body.astype(np.float32).mean(axis=0)
+    rng = col_ink.max() - col_ink.min()
+    if rng < 8:
+        raise OMRError("La imagen no tiene suficiente contraste para ubicar columnas "
+                        "(¿es realmente una foto de la tabla RESPUESTAS?).")
+    col_norm = (col_ink - col_ink.min()) / rng
+    k = np.ones(5) / 5
+    col_smooth = np.convolve(col_norm, k, mode="same")
+
+    objetivo = bandas_esperadas or max_bandas
+    bands, mask = [], col_smooth > 0.15
+    for umbral in (0.15, 0.10, 0.07, 0.045, 0.03):
+        candidatas, mask_u = _omr_bandas_por_gaps(col_smooth, bw, umbral)
+        if len(candidatas) >= objetivo:
+            bands, mask = candidatas, mask_u
+            break
+        if len(candidatas) > len(bands):
+            bands, mask = candidatas, mask_u
+
+    if len(bands) > max_bandas:
+        bands = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:max_bandas]
+        bands = sorted(bands, key=lambda b: b[0])
+
+    if len(bands) < objetivo:
+        if not permitir_reparto_geometrico:
+            raise OMRError(
+                f"Solo se distinguen {len(bands)} de las {objetivo} columnas esperadas y esta imagen "
+                "es un recorte sin validar (no la hoja completa) -- no se fuerza un reparto geométrico "
+                "porque podría fabricar una columna que no está realmente en la foto.")
+        idx_contenido = np.where(col_smooth > 0.03)[0]
+        x0c, x1c = (int(idx_contenido[0]), int(idx_contenido[-1]) + 1) if len(idx_contenido) else (0, bw)
+        ancho = (x1c - x0c) / objetivo
+        bands = [(int(x0c + i * ancho), int(x0c + (i + 1) * ancho)) for i in range(objetivo)]
+
+    return header_bottom, bands
+
+
+def _omr_kmeans_1d(values, k, iters=50):
+    values = np.asarray(values, dtype=np.float64)
+    lo, hi = values.min(), values.max()
+    centers = np.linspace(lo, hi, k) if hi > lo else np.full(k, lo)
+    for _ in range(iters):
+        d = np.abs(values[:, None] - centers[None, :])
+        assign = d.argmin(axis=1)
+        new_centers = centers.copy()
+        for i in range(k):
+            pts = values[assign == i]
+            if len(pts) > 0:
+                new_centers[i] = pts.mean()
+        if np.allclose(new_centers, centers):
+            break
+        centers = new_centers
+    return np.sort(centers)
+
+
+def _omr_y_centers_uniforme(bh, n_filas):
+    margen_y = bh * 0.02
+    return np.linspace(margen_y, bh - margen_y, n_filas)
+
+
+def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
+    """Ajusta, PARA CADA BANDA POR SEPARADO, sus 20 centros de fila y sus 5 centros
+    de columna, usando detección de círculos (Hough) + kmeans 1D. Si Hough no
+    encuentra suficientes círculos en una banda puntual, esa banda cae a una
+    grilla uniforme por proporciones — las demás siguen con su ajuste por círculos."""
+    bh, bw = body_gray.shape
+    blur = cv2.medianBlur(body_gray, 3)
+    min_band_w = min(x1 - x0 for x0, x1 in bands)
+    r_guess = max(3, min_band_w // 12)
+    circles = cv2.HoughCircles(
+        blur, cv2.HOUGH_GRADIENT, dp=1, minDist=max(4, r_guess),
+        param1=60, param2=14, minRadius=max(2, int(r_guess * 0.6)),
+        maxRadius=int(r_guess * 1.8),
+    )
+    pts = circles[0] if circles is not None else np.empty((0, 3))
+
+    y_centers_por_banda, band_x_centers, radios = [], [], []
+    for (x0, x1) in bands:
+        sel = pts[(pts[:, 0] >= x0) & (pts[:, 0] < x1)]
+        if len(sel) >= max(5 * n_filas * 0.35, 10):
+            y_centers_por_banda.append(_omr_kmeans_1d(sel[:, 1], n_filas))
+            band_x_centers.append(_omr_kmeans_1d(sel[:, 0], 5))
+            radios.append(float(np.median(sel[:, 2])))
+        else:
+            y_centers_por_banda.append(_omr_y_centers_uniforme(bh, n_filas))
+            bw_band = x1 - x0
+            num_w = bw_band * 0.18
+            xs = x0 + num_w + (np.arange(5) + 0.5) * ((bw_band - num_w) / 5)
+            band_x_centers.append(xs)
+            radios.append(max(3.0, min_band_w * 0.08))
+
+    radio = float(np.median(radios))
+    return np.array(y_centers_por_banda), np.array(band_x_centers), radio
+
+
+def _omr_oscuridad_celda(gray, cx, cy, r):
+    x0, x1 = max(0, int(cx - r)), int(cx + r + 1)
+    y0, y1 = max(0, int(cy - r)), int(cy + r + 1)
+    patch = gray[y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0
+    return 255.0 - float(patch.mean())
+
+
+def omr_calcular_puntajes(body_gray, y_centers_por_banda, band_x_centers, radio):
+    """Devuelve lista de dicts {A:.., B:.., ..} de oscuridad cruda por pregunta, en orden P1..Pn."""
+    sample_r = max(2.0, radio * 0.75)
+    filas = []
+    for bi, band_x in enumerate(band_x_centers):
+        for cy in y_centers_por_banda[bi]:
+            fila = {OMR_LETRAS[li]: _omr_oscuridad_celda(body_gray, cx, cy, sample_r)
+                    for li, cx in enumerate(band_x)}
+            filas.append(fila)
+    return filas
+
+
+def omr_clasificar_pregunta(scores, baseline, peak, umbrales=OMR_THRESHOLDS):
+    letras = list(scores.keys())
+    vals = np.array([scores[l] for l in letras])
+    rng = max(peak - baseline, 1e-6)
+    norm = (vals - baseline) / rng
+    order = np.argsort(norm)[::-1]
+    best_i, second_i = order[0], order[1]
+    best_v, second_v = norm[best_i], norm[second_i]
+    margin = best_v - second_v
+
+    doble = best_v > umbrales["DOUBLE_MARK_THRESHOLD"] and second_v > umbrales["DOUBLE_MARK_THRESHOLD"]
+
+    if best_v < umbrales["MIN_MARK_SCORE"]:
+        return {"letra": None, "status": "sin_marca",
+                "omr_confidence": round(max(0.0, min(1.0, float(best_v))), 3)}
+    if doble:
+        return {"letra": None, "status": "doble_marca",
+                "omr_confidence": round(float(margin), 3)}
+    if margin < umbrales["AMBIGUOUS_MARGIN"]:
+        return {"letra": None, "status": "ambiguo",
+                "omr_confidence": round(float(margin), 3)}
+    alta = margin >= umbrales["HIGH_CONFIDENCE_MARGIN"]
+    conf = max(0.0, min(1.0, 0.5 + margin))
+    return {"letra": letras[best_i],
+            "status": "alta_confianza" if alta else "confianza_media",
+            "omr_confidence": round(float(conf), 3)}
+
+
+def omr_recortar_pregunta(body_bgr, y_centers_por_banda, band_x_centers, radio, idx_local, n_bandas):
+    """Recorta la fila completa (5 burbujas + contexto) de la pregunta con índice local
+    idx_local (0-based, orden banda por banda), sobre la imagen SIN comprimir, para
+    mostrársela a la persona en la UI de corrección manual."""
+    n_filas = len(y_centers_por_banda[0])
+    bi, ri = divmod(idx_local, n_filas)
+    if bi >= len(band_x_centers):
+        raise OMRError(f"idx_local={idx_local} cae fuera de las {len(band_x_centers)} bandas detectadas "
+                        f"({n_filas} filas/banda) — la grilla no cubre esa pregunta.")
+    band_x = band_x_centers[bi]
+    cy = y_centers_por_banda[bi][ri]
+    x0 = band_x[0] - radio * 3.2
+    x1 = band_x[-1] + radio * 2.2
+    y0 = cy - radio * 2.4
+    y1 = cy + radio * 2.4
+    h, w = body_bgr.shape[:2]
+    x0, x1 = max(0, int(x0)), min(w, int(x1))
+    y0, y1 = max(0, int(y0)), min(h, int(y1))
+    return body_bgr[y0:y1, x0:x1]
+
+
+OMR_COLOR_ALTA = (60, 180, 60)      # verde (BGR)
+OMR_COLOR_MEDIA = (0, 200, 230)     # amarillo/naranjo
+OMR_COLOR_AMBIGUA = (40, 40, 220)   # rojo
+OMR_COLOR_BLANCO = (150, 150, 150)  # gris (sin marca, con confianza suficiente para no ser dudosa)
+
+
+def omr_anotar_diagnostico(body_bgr, y_centers_por_banda, band_x_centers, radio, resultados,
+                            offset_pregunta=0, escala=3):
+    """Genera la imagen de diagnóstico: un círculo alrededor de la burbuja elegida (o un
+    punto junto a la fila si no se eligió ninguna) y una etiqueta "Pn:letra" coloreada
+    según el estado final de cada pregunta. `escala` agranda la imagen para legibilidad."""
+    base = cv2.resize(body_bgr, (body_bgr.shape[1] * escala, body_bgr.shape[0] * escala),
+                       interpolation=cv2.INTER_NEAREST)
+    dbg = base.copy()
+    n_filas = len(y_centers_por_banda[0])
+    for idx, r in enumerate(resultados):
+        bi, ri = divmod(idx, n_filas)
+        if bi >= len(band_x_centers):
+            continue
+        band_x = band_x_centers[bi]
+        cy = y_centers_por_banda[bi][ri] * escala
+        q = offset_pregunta + idx + 1
+        status = r["status"]
+        color = {
+            "alta_confianza": OMR_COLOR_ALTA, "confianza_media": OMR_COLOR_MEDIA, "sin_marca": OMR_COLOR_BLANCO,
+            "confiable": OMR_COLOR_ALTA, "revisar_media": OMR_COLOR_MEDIA,
+            "revisar_dudoso": OMR_COLOR_AMBIGUA, "blanco": OMR_COLOR_BLANCO,
+        }.get(status, OMR_COLOR_AMBIGUA)
+        if r["letra"]:
+            li = OMR_LETRAS.index(r["letra"])
+            cx = band_x[li] * escala
+            cv2.circle(dbg, (int(cx), int(cy)), int(radio * 1.3 * escala), color, max(1, escala // 2))
+        else:
+            cv2.circle(dbg, (int(band_x[0] * escala - radio * escala), int(cy)), 3 * escala, color, -1)
+        conf_pct = round(r.get("omr_confidence", 0) * 100)
+        label = f"{q}:{r['letra'] or '?'} {conf_pct}%"
+        cv2.putText(dbg, label, (int(band_x[0] * escala - radio * 3.4 * escala), int(cy) - int(radio * escala) - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32 * escala / 2, color, 1, cv2.LINE_AA)
+    return dbg
+
+
+def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
+    """
+    Punto de entrada principal del motor OMR: toma una imagen ya cargada (BGR,
+    resolución original, SIN recomprimir) y devuelve la grilla ajustada +
+    resultados crudos por pregunta local (orden banda por banda, 20 filas/banda).
+
+    es_recorte=False: se asume hoja completa -> se localiza el bloque
+      RESPUESTAS y se endereza antes de leer la grilla.
+    es_recorte=True: la imagen YA es (una porción de) la tabla RESPUESTAS ->
+      se trabaja directo sobre toda la imagen.
+    n_preguntas: si se indica, cuántas bandas (columnas de 20) hacen falta
+      para cubrirlo -- permite el reparto geométrico proporcional cuando la
+      foto no tiene contraste suficiente para distinguir los huecos reales.
+
+    Lanza OMRError si no logra ubicar una grilla legible (la hoja queda sin
+    resolver para completar a mano; nunca se reemplaza con una lectura de IA).
+    """
+    img = img_bgr
+    if not es_recorte:
+        quad = omr_detectar_bloque_respuestas(img)
+        if quad is None:
+            raise OMRError("No se pudo localizar el bloque RESPUESTAS en la hoja completa.")
+        img = omr_enderezar_region(img, quad)
+
+    bandas_esperadas = min(max_bandas, -(-n_preguntas // OMR_N_FILAS_POR_BLOQUE)) if n_preguntas else None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    header_bottom, bands = omr_detectar_header_y_bandas(
+        gray, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
+        permitir_reparto_geometrico=not es_recorte)
+    body_gray = gray[header_bottom:, :]
+    body_bgr = img[header_bottom:, :]
+
+    y_centers_por_banda, band_x_centers, radio = omr_ajustar_grilla(body_gray, bands)
+    scores = omr_calcular_puntajes(body_gray, y_centers_por_banda, band_x_centers, radio)
+
+    # baseline/peak POR BANDA, no globales: tolera iluminación despareja entre
+    # columnas (sombra de la mano, ángulo de la luz en la foto).
+    n_filas = len(y_centers_por_banda[0])
+    resultados = []
+    for bi in range(len(band_x_centers)):
+        banda_scores = scores[bi * n_filas:(bi + 1) * n_filas]
+        banda_vals = np.array([v for s in banda_scores for v in s.values()])
+        baseline = float(np.percentile(banda_vals, 15))
+        peak = float(np.percentile(banda_vals, 97))
+        resultados.extend(omr_clasificar_pregunta(s, baseline, peak) for s in banda_scores)
+
+    return {
+        "body_bgr": body_bgr,
+        "y_centers": y_centers_por_banda,
+        "band_x_centers": band_x_centers,
+        "radio": radio,
+        "n_bandas": len(bands),
+        "resultados": resultados,
+    }
+
+# ═══════════════════════ fin motor OMR ═══════════════════════════════════
+
 
 st.set_page_config(
     page_title="Revisor de Pruebas",
@@ -39,7 +470,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "2.4.0"
+VERSION_APP = "3.0.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -430,8 +861,8 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
 
 # ─── Motor OMR: única fuente de las respuestas ────────────────────────
 # En vez de pedirle a Claude que lea las 400 burbujas de la hoja, un motor de
-# visión clásica (ver omr.py) mide directamente cuánto más oscura está cada
-# burbuja que el papel en blanco, comparando siempre dentro de la misma fila.
+# visión clásica (funciones omr_* más arriba) mide directamente cuánto más
+# oscura está cada burbuja que el papel en blanco, comparando dentro de la fila.
 # Claude Vision NUNCA lee ni confirma burbujas — solo transcribe nombre/RUT de
 # la cabecera (función aparte, más abajo). Las preguntas que el motor no logra
 # determinar con confianza quedan "dudosas" con un recorte para revisión
@@ -447,7 +878,7 @@ def _bgr_a_jpeg_b64(img_bgr, calidad: int = 95, lado_max: int = None):
                               interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, calidad])
     if not ok:
-        raise omr.OMRError("No se pudo codificar un recorte OMR como JPEG.")
+        raise OMRError("No se pudo codificar un recorte OMR como JPEG.")
     return base64.standard_b64encode(buf.tobytes()).decode()
 
 
@@ -472,37 +903,20 @@ def llamar_claude_identificacion(cliente, header_bgr) -> dict:
         return {}
 
 
-def _analizar_imagen_omr(img_bgr, es_recorte: bool, n: int):
-    """
-    Envoltorio defensivo alrededor de omr.analizar_imagen(): si por cualquier
-    motivo el módulo omr.py que está corriendo no coincide exactamente con esta
-    versión de app_revisor.py (por ejemplo, un redeploy que por una condición de
-    carrera actualiza un archivo antes que el otro, o un entorno con una copia
-    en caché de un archivo), un parámetro nuevo puede no existir todavía del
-    otro lado. En vez de que esa sola hoja falle con un TypeError confuso, se
-    reintenta sin el parámetro opcional — se pierde esa mejora puntual para esa
-    hoja, pero el resto del pipeline sigue funcionando igual.
-    """
-    try:
-        return omr.analizar_imagen(img_bgr, es_recorte=es_recorte, n_preguntas=n)
-    except TypeError:
-        return omr.analizar_imagen(img_bgr, es_recorte=es_recorte)
-
-
 def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
     """
     Corre el motor OMR puro (sin llamadas a la API) sobre la imagen a resolución
-    original. Devuelve la salida cruda de omr.analizar_imagen truncada a n
+    original. Devuelve la salida cruda de omr_analizar_imagen truncada a n
     preguntas, más la imagen (BGR, sin comprimir) por si hace falta recortar
     preguntas puntuales para mostrárselas a la persona durante la corrección
-    manual. Lanza omr.OMRError si no logra ubicar una grilla legible para las n
+    manual. Lanza OMRError si no logra ubicar una grilla legible para las n
     preguntas configuradas (la llamante debe tratar esa hoja como no leíble).
     """
     img_pil = abrir_imagen_corregida(datos_bytes)
     if img_pil is None:
-        raise omr.OMRError("La imagen no se pudo decodificar.")
+        raise OMRError("La imagen no se pudo decodificar.")
     img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    salida = _analizar_imagen_omr(img_bgr, solo_respuestas, n)
+    salida = omr_analizar_imagen(img_bgr, solo_respuestas, n_preguntas=n)
     resultados = salida["resultados"]
     n_disponibles = len(resultados)
     if n_disponibles < n:
@@ -513,19 +927,19 @@ def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict
         # grilla, así que cualquier recorte o anotación posterior sobre esas
         # posiciones revienta con un índice fuera de rango. Es más seguro
         # tratar esta hoja como no leíble (queda para completar a mano).
-        raise omr.OMRError(
+        raise OMRError(
             f"La tabla detectada solo cubre {n_disponibles} de las {n} preguntas configuradas "
             "(probablemente la foto no muestra todas las columnas de RESPUESTAS).")
     salida["resultados"] = resultados[:n]
     salida["img_bgr_original"] = img_bgr
-    salida["quad_respuestas"] = None if solo_respuestas else omr.detectar_bloque_respuestas(img_bgr)
+    salida["quad_respuestas"] = None if solo_respuestas else omr_detectar_bloque_respuestas(img_bgr)
     return salida
 
 
 def _crop_dudosa_b64_jpeg(body_bgr, y_centers, band_x_centers, radio, idx_local, n_bandas, escala: int = 5) -> bytes:
     """Recorte ampliado de una pregunta dudosa, para mostrárselo a la persona en
     la UI de corrección (no se envía a ninguna IA)."""
-    crop = omr.recortar_pregunta(body_bgr, y_centers, band_x_centers, radio, idx_local, n_bandas)
+    crop = omr_recortar_pregunta(body_bgr, y_centers, band_x_centers, radio, idx_local, n_bandas)
     crop_grande = cv2.resize(crop, (crop.shape[1] * escala, crop.shape[0] * escala),
                               interpolation=cv2.INTER_NEAREST)
     ok, buf = cv2.imencode(".jpg", crop_grande, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -580,7 +994,7 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
     resultados = salida["resultados"]
     body_bgr = salida["body_bgr"]
     y_centers, band_x_centers, radio = salida["y_centers"], salida["band_x_centers"], salida["radio"]
-    umbral_blanco = omr.THRESHOLDS["BLANK_REVIEW_MARGIN"]
+    umbral_blanco = OMR_THRESHOLDS["BLANK_REVIEW_MARGIN"]
 
     respuestas, dudosas, metodo_por_pregunta, confianza_por_pregunta = [], [], [], []
     for i, r in enumerate(resultados):
@@ -655,7 +1069,7 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
         rd["letra"] = respuestas[i]
         rd["status"] = metodo_por_pregunta[i]
         resultados_diag.append(rd)
-    diag_bgr = omr.anotar_diagnostico(body_bgr, y_centers, band_x_centers, radio, resultados_diag)
+    diag_bgr = omr_anotar_diagnostico(body_bgr, y_centers, band_x_centers, radio, resultados_diag)
     ok, buf = cv2.imencode(".jpg", diag_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     res["omr_diagnostico_bytes"] = buf.tobytes() if ok else None
 

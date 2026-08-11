@@ -1,9 +1,14 @@
 """
 Harness de métricas para comparar 3 métodos de lectura de hojas de respuestas:
   A) "ia"      — flujo 100% Claude Vision, Claude lee las burbujas (app_revisor.procesar_imagen)
-  B) "omr"     — motor OMR puro, sin ninguna llamada a la API (omr.analizar_imagen)
+  B) "omr"     — motor OMR puro, sin ninguna llamada a la API (omr_analizar_imagen)
   C) "hibrido" — respuestas 100% del motor OMR; Claude solo transcribe nombre/RUT de la
                  cabecera (nunca lee burbujas) (app_revisor.procesar_imagen_hibrido)
+
+El motor OMR vive inline dentro de app_revisor.py (no en un módulo aparte) a
+propósito, para eliminar la posibilidad de que ese archivo y un omr.py separado
+queden desincronizados en un redeploy. Este script extrae las funciones que
+necesita directamente del código fuente de app_revisor.py, sin ejecutar su UI.
 
 Uso (requiere una API key de Anthropic solo para los métodos "ia" e "hibrido";
 "omr" no llama a la API y se puede correr sin key):
@@ -36,8 +41,6 @@ from collections import defaultdict
 
 import cv2
 import numpy as np
-
-import omr
 
 LETRAS_CM = ["A", "B", "C", "D", "E", "—"]  # "—" representa None/sin respuesta
 
@@ -87,10 +90,10 @@ def evaluar_respuestas(pred: list, real: list) -> dict:
     }
 
 
-def correr_metodo_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
+def correr_metodo_omr(app_module, datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
     t0 = time.time()
     img_bgr = cv2.imdecode(np.frombuffer(datos_bytes, np.uint8), cv2.IMREAD_COLOR)
-    salida = omr.analizar_imagen(img_bgr, es_recorte=solo_respuestas)
+    salida = app_module.omr_analizar_imagen(img_bgr, es_recorte=solo_respuestas, n_preguntas=n)
     resultados = (salida["resultados"] + [{"letra": None, "status": "sin_marca", "omr_confidence": 0.0}] * n)[:n]
     respuestas = [r["letra"] for r in resultados]
     elapsed = time.time() - t0
@@ -122,7 +125,9 @@ def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuest
 
 def _cargar_app_module():
     """Carga app_revisor.py como módulo de funciones puras, sin ejecutar su UI de Streamlit,
-    igual que se hizo durante el desarrollo/pruebas de este pipeline."""
+    igual que se hizo durante el desarrollo/pruebas de este pipeline. El bloque completo del
+    motor OMR (entre los comentarios "MOTOR OMR" y "fin motor OMR") se extrae de una sola vez;
+    el resto de funciones se extrae una por una como antes."""
     import re as _re
     import types
     ruta = __file__.replace("omr_metrics.py", "app_revisor.py")
@@ -135,12 +140,14 @@ def _cargar_app_module():
         end = start + len(f"def {nombre}") + (m.start() if m else len(rest))
         return src[start:end]
 
+    bloque_omr = src[src.index("OMR_THRESHOLDS = {"):src.index("# ═══════════════════════ fin motor OMR")]
+
     nombres = ["prompt_dinamico", "prompt_identificacion",
                "abrir_imagen_corregida", "preparar_imagenes", "mejorar_contraste_burbujas",
                "_img_a_b64_jpeg", "evaluar_sospecha", "_llamar_claude", "procesar_imagen",
                "_bgr_a_jpeg_b64", "llamar_claude_identificacion", "_crop_dudosa_b64_jpeg",
-               "_analizar_imagen_omr", "analizar_hoja_omr",
-               "_fallback_no_leido", "_construir_resultado_omr", "procesar_imagen_hibrido"]
+               "analizar_hoja_omr", "_fallback_no_leido", "_construir_resultado_omr",
+               "procesar_imagen_hibrido"]
     import io, base64, hashlib, json as _json
     from collections import Counter
     from PIL import Image, ImageEnhance, ImageOps
@@ -149,10 +156,11 @@ def _cargar_app_module():
     ns = mod.__dict__
     ns.update({
         "io": io, "json": _json, "re": _re, "base64": base64, "hashlib": hashlib, "Counter": Counter,
-        "np": np, "cv2": cv2, "omr": omr, "Image": Image, "ImageEnhance": ImageEnhance, "ImageOps": ImageOps,
+        "np": np, "cv2": cv2, "Image": Image, "ImageEnhance": ImageEnhance, "ImageOps": ImageOps,
         "anthropic": anthropic, "LETRAS_VALIDAS": {"A", "B", "C", "D", "E"},
         "REFUERZO_REINTENTO": _re.search(r'REFUERZO_REINTENTO = \(([\s\S]*?)\)\n', src).group(0).split("=", 1)[1].strip().rstrip(")").strip("(").strip(),
     })
+    exec(bloque_omr, ns)
     for n in nombres:
         exec(extraer(n), ns)
     return mod
@@ -169,14 +177,13 @@ def main():
     casos = json.load(open(args.dataset, encoding="utf-8"))
 
     cliente = None
-    app_module = None
     if "ia" in metodos or "hibrido" in metodos:
         if not args.api_key:
             print("Error: --api-key es obligatorio para los métodos 'ia' o 'hibrido'.", file=sys.stderr)
             sys.exit(1)
         import anthropic
         cliente = anthropic.Anthropic(api_key=args.api_key, timeout=90.0, max_retries=1)
-        app_module = _cargar_app_module()
+    app_module = _cargar_app_module()  # siempre hace falta: "omr" también vive en app_revisor.py
 
     resultados_por_metodo = defaultdict(list)
     tiempos = defaultdict(list)
@@ -192,7 +199,7 @@ def main():
         for metodo in metodos:
             try:
                 if metodo == "omr":
-                    salida = correr_metodo_omr(datos_bytes, solo_resp, n)
+                    salida = correr_metodo_omr(app_module, datos_bytes, solo_resp, n)
                 elif metodo == "ia":
                     salida = correr_metodo_ia(app_module, cliente, datos_bytes, solo_resp, n)
                 elif metodo == "hibrido":
