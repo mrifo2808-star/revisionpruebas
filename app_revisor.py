@@ -15,6 +15,7 @@ import qrcode
 import pandas as pd
 import streamlit as st
 import anthropic
+from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -40,30 +41,6 @@ div[data-testid="stDataEditor"] { font-size:13px; }
 div[data-testid="stFileUploader"] > div { min-height: 120px; }
 </style>
 """, unsafe_allow_html=True)
-
-# ─── Acceso restringido por código ──────────────────────────────────
-def verificar_acceso() -> bool:
-    try:
-        codigo_secreto = st.secrets.get("APP_ACCESS_CODE", "")
-    except Exception:
-        codigo_secreto = ""
-    if not codigo_secreto:
-        return True
-    if st.session_state.get("autenticado"):
-        return True
-    st.markdown("## 🔒 Acceso restringido")
-    st.caption("Ingresa el código que te enviaron para usar esta app.")
-    codigo = st.text_input("Código de acceso", type="password", key="codigo_acceso")
-    if st.button("Ingresar", type="primary"):
-        if codigo == codigo_secreto:
-            st.session_state["autenticado"] = True
-            st.rerun()
-        else:
-            st.error("Código incorrecto.")
-    return False
-
-if not verificar_acceso():
-    st.stop()
 
 # ─── Estado de sesión ────────────────────────────────────────────────
 def df_pauta_vacio(n: int) -> pd.DataFrame:
@@ -131,6 +108,20 @@ def tiene_secret() -> bool:
 
 TIPOS_MIME = {"image/jpeg":"image/jpeg","image/jpg":"image/jpeg",
               "image/png":"image/png","image/webp":"image/webp","image/heic":"image/jpeg"}
+
+def comprimir_imagen(datos_bytes: bytes, mime: str, lado_max: int = 1600, calidad: int = 85):
+    """Reduce tamaño/resolución para que la subida desde datos móviles no se cuelgue."""
+    try:
+        img = Image.open(io.BytesIO(datos_bytes))
+        img = img.convert("RGB")
+        if max(img.size) > lado_max:
+            escala = lado_max / max(img.size)
+            img = img.resize((int(img.width*escala), int(img.height*escala)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=calidad, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return datos_bytes, mime
 
 def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
     data = base64.standard_b64encode(datos_bytes).decode()
@@ -472,10 +463,11 @@ with tab_cargar:
             contenido = f.read()
             h = hashlib.md5(contenido).hexdigest()
             if h not in hashes_conocidos:
+                comprimido, mime_final = comprimir_imagen(contenido, TIPOS_MIME.get(f.type, "image/jpeg"))
                 idx = len(st.session_state.fotos_pendientes) + len(st.session_state.resultados) + 1
                 st.session_state.fotos_pendientes[f"foto_{idx:03d}"] = {
-                    "nombre": f.name, "bytes": contenido,
-                    "mime": TIPOS_MIME.get(f.type, "image/jpeg"), "hash": h,
+                    "nombre": f.name, "bytes": comprimido,
+                    "mime": mime_final, "hash": h,
                 }
                 hashes_conocidos.add(h)
                 agregadas += 1
@@ -498,7 +490,7 @@ with tab_cargar:
         if not key:
             st.error("Ingresa tu API Key en el panel lateral.")
         elif st.button(f"🚀 Procesar {len(pendientes)} hoja(s)", type="primary", use_container_width=True):
-            cliente = anthropic.Anthropic(api_key=key)
+            cliente = anthropic.Anthropic(api_key=key, timeout=60.0, max_retries=1)
             prog = st.progress(0, text="Iniciando...")
             errs = []
             items = list(pendientes.items())
@@ -508,6 +500,8 @@ with tab_cargar:
                     res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n)
                     res["hash"] = foto["hash"]
                     st.session_state.resultados[id_unico] = res
+                except anthropic.APITimeoutError:
+                    errs.append(f"{foto['nombre']}: tiempo de espera agotado (conexión lenta), reintenta.")
                 except Exception as e:
                     errs.append(f"{foto['nombre']}: {e}")
                 st.session_state.fotos_pendientes.pop(id_unico, None)
