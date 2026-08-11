@@ -78,14 +78,10 @@ THRESHOLDS = {
 N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
 LETRAS = ["A", "B", "C", "D", "E"]
 
-# Estados que el motor NO logra resolver con confianza total y por lo tanto
-# quedan marcados como "dudosos" para revisión manual de la persona (nunca se
-# le pide a una IA que decida por el motor).
-ESTADOS_REVISABLES = {"ambiguo", "doble_marca", "sin_marca", "confianza_media"}
-
 
 class OMRError(Exception):
-    """Fallo irrecuperable de una etapa del pipeline OMR (la app debe caer al flujo 100% IA)."""
+    """Fallo irrecuperable de una etapa del pipeline OMR — la hoja queda sin
+    resolver para completar a mano (nunca se reemplaza con una lectura de IA)."""
 
 
 # ─── 1) Localizacion del bloque RESPUESTAS dentro de una hoja completa ───────
@@ -173,7 +169,8 @@ def _bandas_por_gaps(col_smooth: np.ndarray, bw: int, umbral: float):
     return bands, mask
 
 
-def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esperadas: int = None):
+def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esperadas: int = None,
+                              permitir_reparto_geometrico: bool = True):
     """
     Devuelve (header_bottom, bandas) donde bandas es una lista de (x0,x1) — una
     por cada bloque de 20 preguntas visible en la imagen (1 a 4, segun si la
@@ -187,13 +184,25 @@ def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esper
     puede no leerse lo bastante "blanco" como para distinguirse. Por eso:
       1. se prueban varios umbrales de sensibilidad, del mas estricto al mas
          permisivo, hasta encontrar `bandas_esperadas` bandas reales;
-      2. si ninguno lo logra, se cae a dividir el ancho total de contenido en
-         `bandas_esperadas` franjas iguales -- la plantilla tiene columnas de
-         ancho fijo por diseño, asi que un reparto proporcional es una base
-         razonable incluso sin poder ver los huecos con claridad. Esto NUNCA
-         implica reescalar ni comprimir la imagen: se sigue trabajando sobre
-         los mismos pixeles originales, solo cambia dónde se traza el límite
-         de cada columna.
+      2. si ninguno lo logra Y `permitir_reparto_geometrico` es True, se cae a
+         dividir el ancho total de contenido en `bandas_esperadas` franjas
+         iguales -- la plantilla tiene columnas de ancho fijo por diseño, asi
+         que un reparto proporcional es una base razonable incluso sin poder
+         ver los huecos con claridad. Esto NUNCA implica reescalar ni
+         comprimir la imagen: se sigue trabajando sobre los mismos pixeles
+         originales, solo cambia dónde se traza el límite de cada columna.
+
+    IMPORTANTE sobre `permitir_reparto_geometrico`: este reparto asume que el
+    contenido visible SÍ contiene las `bandas_esperadas` columnas completas,
+    solo que sus huecos no se distinguen -- una suposicion razonable cuando la
+    región ya fue validada de forma independiente como la tabla RESPUESTAS
+    completa (detectar_bloque_respuestas). Si en cambio la imagen es un
+    recorte arbitrario que el usuario subió (es_recorte=True) y genuinamente
+    NO alcanza a mostrar todas las columnas, forzar el reparto fabricaría una
+    columna que no existe y devolvería respuestas con confianza alta pero
+    incorrectas -- el peor escenario posible. Por eso analizar_imagen() solo
+    pasa permitir_reparto_geometrico=True cuando ya validó la región completa.
+
     `bandas_esperadas` normalmente es ceil(n_preguntas/20) -- cuantas columnas
     de 20 preguntas hacen falta para cubrir la pauta configurada.
     """
@@ -214,8 +223,14 @@ def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esper
 
     col_ink = 255 - body.astype(np.float32).mean(axis=0)
     rng = col_ink.max() - col_ink.min()
-    if rng < 1e-6:
-        raise OMRError("La imagen no tiene suficiente contraste para ubicar columnas.")
+    if rng < 8:
+        # Contraste casi nulo de lado a lado: no hay columnas de texto/burbujas
+        # reales que distinguir (p.ej. una foto de otra cosa, o una hoja en
+        # blanco). El reparto proporcional de más abajo asume que SÍ hay una
+        # tabla real por leer, así que mejor fallar acá con un mensaje claro
+        # que "leer" una tabla inexistente con confianza inventada.
+        raise OMRError("La imagen no tiene suficiente contraste para ubicar columnas "
+                        "(¿es realmente una foto de la tabla RESPUESTAS?).")
     col_norm = (col_ink - col_ink.min()) / rng
     k = np.ones(5) / 5
     col_smooth = np.convolve(col_norm, k, mode="same")
@@ -235,6 +250,11 @@ def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esper
         bands = sorted(bands, key=lambda b: b[0])
 
     if len(bands) < objetivo:
+        if not permitir_reparto_geometrico:
+            raise OMRError(
+                f"Solo se distinguen {len(bands)} de las {objetivo} columnas esperadas y esta imagen "
+                "es un recorte sin validar (no la hoja completa) -- no se fuerza un reparto geométrico "
+                "porque podría fabricar una columna que no está realmente en la foto.")
         # Ningún umbral encontró suficientes huecos reales entre columnas (foto
         # borrosa/comprimida/poco contraste): repartir el ancho de contenido en
         # partes iguales en vez de rendirse. Se usa el rango donde SÍ hay algo
@@ -377,16 +397,16 @@ def clasificar_pregunta(scores: dict, baseline: float, peak: float, umbrales: di
             "omr_confidence": round(float(conf), 3)}
 
 
-# ─── 5) Recorte de una pregunta puntual (para revision por IA) ──────────────
+# ─── 5) Recorte de una pregunta puntual (para revision manual) ──────────────
 
 def recortar_pregunta(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers, radio: float,
                        idx_local: int, n_bandas: int) -> np.ndarray:
     """
     Recorta la fila completa (5 burbujas + algo de contexto) de la pregunta con
     indice local idx_local (0-based, orden banda por banda como en calcular_puntajes),
-    directamente sobre la imagen SIN comprimir, para enviarla a Claude como
-    segunda revision. Incluye holgura vertical/horizontal generosa por si la
-    grilla esta levemente desalineada.
+    directamente sobre la imagen SIN comprimir, para mostrársela a la persona
+    en la UI de corrección manual. Incluye holgura vertical/horizontal generosa
+    por si la grilla esta levemente desalineada.
     """
     n_filas = len(y_centers_por_banda[0])
     bi, ri = divmod(idx_local, n_filas)
@@ -469,8 +489,8 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4, 
       geometrico proporcional cuando la foto no tiene contraste suficiente
       para distinguir los huecos reales entre columnas, en vez de fallar.
 
-    Lanza OMRError si no logra ubicar una grilla legible (la app debe caer al
-    flujo 100% IA en ese caso).
+    Lanza OMRError si no logra ubicar una grilla legible (la hoja queda sin
+    resolver para completar a mano; nunca se reemplaza con una lectura de IA).
     """
     img = img_bgr
     if not es_recorte:
@@ -481,7 +501,15 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4, 
 
     bandas_esperadas = min(max_bandas, -(-n_preguntas // N_FILAS_POR_BLOQUE)) if n_preguntas else None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    header_bottom, bands = detectar_header_y_bandas(gray, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas)
+    # El reparto geométrico de columnas (ver detectar_header_y_bandas) solo se
+    # permite cuando la región ya fue validada como la tabla RESPUESTAS
+    # completa (es_recorte=False, arriba). Para un recorte que subió el
+    # usuario directamente, no hay forma de confirmar que de verdad contiene
+    # todas las columnas esperadas, así que ante la duda se prefiere fallar
+    # con un mensaje claro antes que fabricar una columna inexistente.
+    header_bottom, bands = detectar_header_y_bandas(
+        gray, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
+        permitir_reparto_geometrico=not es_recorte)
     body_gray = gray[header_bottom:, :]
     body_bgr = img[header_bottom:, :]
 

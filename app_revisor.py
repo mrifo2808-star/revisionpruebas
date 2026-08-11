@@ -39,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "2.3.1"
+VERSION_APP = "2.4.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -428,17 +428,17 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
     return res
 
 
-# ─── Motor OMR + IA solo para dudas (beta) ────────────────────────────
-# Pipeline paralelo al 100%-IA de arriba (que se deja intacto como respaldo
-# garantizado): en vez de pedirle a Claude que lea las 400 burbujas de la hoja,
-# un motor de visión clásica (ver omr.py) mide directamente cuánto más oscura
-# está cada burbuja que el papel en blanco, comparando siempre dentro de la
-# misma fila. Solo las preguntas donde ese análisis no llega a una conclusión
-# confiable (marca débil, dos alternativas parecidas, mancha corrida) se
-# recortan y se mandan a Claude para una segunda mirada puntual — el resto se
-# resuelve sin llamar a la API. Si CUALQUIER etapa de este pipeline falla
-# (imagen no decodificable, tabla no localizable, etc.), se cae automáticamente
-# al flujo 100%-IA de siempre.
+# ─── Motor OMR: única fuente de las respuestas ────────────────────────
+# En vez de pedirle a Claude que lea las 400 burbujas de la hoja, un motor de
+# visión clásica (ver omr.py) mide directamente cuánto más oscura está cada
+# burbuja que el papel en blanco, comparando siempre dentro de la misma fila.
+# Claude Vision NUNCA lee ni confirma burbujas — solo transcribe nombre/RUT de
+# la cabecera (función aparte, más abajo). Las preguntas que el motor no logra
+# determinar con confianza quedan "dudosas" con un recorte para revisión
+# manual. Si el motor no logra procesar la hoja (tabla no localizable, imagen
+# ilegible), esa hoja queda entera sin resolver para completar a mano — nunca
+# se rellena con una lectura de IA. El flujo 100%-IA original (procesar_imagen,
+# arriba) sigue disponible como alternativa manual desde el sidebar.
 
 def _bgr_a_jpeg_b64(img_bgr, calidad: int = 95, lado_max: int = None):
     if lado_max and max(img_bgr.shape[:2]) > lado_max:
@@ -512,8 +512,7 @@ def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict
         # resultados "fantasma" es peligroso: no tienen banda/fila real en la
         # grilla, así que cualquier recorte o anotación posterior sobre esas
         # posiciones revienta con un índice fuera de rango. Es más seguro
-        # tratar esto como un fallo del pipeline OMR y caer al flujo 100%-IA
-        # para esta hoja en particular.
+        # tratar esta hoja como no leíble (queda para completar a mano).
         raise omr.OMRError(
             f"La tabla detectada solo cubre {n_disponibles} de las {n} preguntas configuradas "
             "(probablemente la foto no muestra todas las columnas de RESPUESTAS).")
@@ -533,6 +532,27 @@ def _crop_dudosa_b64_jpeg(body_bgr, y_centers, band_x_centers, radio, idx_local,
     return buf.tobytes() if ok else None
 
 
+def _fallback_no_leido(nombre: str, n: int, solo_respuestas: bool, motivo: str) -> dict:
+    """Resultado cuando el motor OMR no pudo leer una hoja, sea por lo que sea
+    (tabla no localizable, imagen ilegible, o cualquier fallo inesperado más
+    adelante en el pipeline). A propósito NO se cae a IA para inventar
+    respuestas — nunca se le pide a Claude que lea burbujas. Todas las
+    preguntas quedan sin resolver, para completar a mano o reprocesar esta
+    foto puntual en modo "Solo IA" desde el sidebar si se prefiere."""
+    return {
+        "respuestas": [None] * n,
+        "dudosas": list(range(1, n + 1)),
+        "archivo": nombre, "n_preguntas": n, "solo_respuestas": solo_respuestas,
+        "apellido_paterno": "", "apellido_materno": "", "nombres": "", "cedula": "", "nro_folleto": "",
+        "omr_meta": {"usado": False, "motivo_fallback": motivo},
+        # Se marca "sospechoso" igual que evaluar_sospecha() para que esta hoja
+        # aparezca en la misma alerta y en la columna "Alerta calidad" del
+        # Excel — si no, una hoja sin leer solo se nota abriéndola una por una.
+        "sospechoso": True,
+        "motivo_sospecha": "El motor OMR no pudo leer esta hoja — todas las preguntas quedaron sin resolver.",
+    }
+
+
 def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
                              solo_respuestas: bool = False) -> dict:
     """
@@ -540,27 +560,23 @@ def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str,
     Vision nunca lee ni confirma burbujas, solo transcribe nombre/RUT cuando la
     imagen es la hoja completa. Lo que el motor no logra determinar con
     confianza queda marcado como "dudosa" con un recorte ampliado adjunto para
-    que la persona lo revise y corrija a mano en **Revisar y corregir** — igual
-    que ya se podía hacer antes, pero ahora también con el recorte de esa fila
-    puntual para no tener que volver a la foto original.
+    que la persona lo revise y corrija a mano en **Revisar y corregir**.
     """
     try:
         salida = analizar_hoja_omr(datos_bytes, solo_respuestas, n)
     except Exception as e:
-        # El motor OMR no pudo procesar esta hoja (tabla no localizable, imagen
-        # ilegible, no muestra las 4 columnas, etc.). A propósito NO se cae a
-        # IA para inventar respuestas — nunca se le pide a Claude que lea
-        # burbujas. Todas las preguntas quedan sin resolver, para completar a
-        # mano o para reprocesar esta foto puntual en modo "Solo IA" desde el
-        # sidebar si se prefiere.
-        return {
-            "respuestas": [None] * n,
-            "dudosas": list(range(1, n + 1)),
-            "archivo": nombre, "n_preguntas": n, "solo_respuestas": solo_respuestas,
-            "apellido_paterno": "", "apellido_materno": "", "nombres": "", "cedula": "", "nro_folleto": "",
-            "omr_meta": {"usado": False, "motivo_fallback": str(e)},
-        }
+        return _fallback_no_leido(nombre, n, solo_respuestas, str(e))
 
+    try:
+        return _construir_resultado_omr(salida, cliente, nombre, n, solo_respuestas)
+    except Exception as e:
+        # Cualquier fallo inesperado DESPUÉS de tener la grilla (p.ej. al
+        # generar el diagnóstico visual o un recorte) tampoco debe tumbar la
+        # hoja con un error crudo: se degrada al mismo resultado "no leído".
+        return _fallback_no_leido(nombre, n, solo_respuestas, str(e))
+
+
+def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_respuestas: bool) -> dict:
     resultados = salida["resultados"]
     body_bgr = salida["body_bgr"]
     y_centers, band_x_centers, radio = salida["y_centers"], salida["band_x_centers"], salida["radio"]
@@ -875,11 +891,9 @@ with st.sidebar:
         st.session_state["modo_captura"] = modo_nuevo
         st.rerun()
     if st.session_state["modo_captura"] == "solo_respuestas":
-        st.caption("✂️ Sube la foto recortada para mostrar **solo** el bloque RESPUESTAS (sin cabecera). "
-                   "Nombre, RUT y folleto quedan en blanco — los completas a mano en **Revisar y corregir**. "
-                   "Es el modo más preciso: toda la resolución se dedica a las burbujas.")
+        st.caption("✂️ Nombre, RUT y folleto quedan en blanco — se completan a mano.")
     else:
-        st.caption("📄 Sube la foto de la hoja completa; la app recorta e identifica al alumno automáticamente.")
+        st.caption("📄 La app recorta e identifica al alumno automáticamente.")
     st.markdown("---")
     st.markdown("**Motor de lectura**")
     if not OMR_DISPONIBLE:
@@ -889,27 +903,17 @@ with st.sidebar:
         omr_nuevo = st.toggle(
             "🔬 Motor OMR — única fuente de las respuestas",
             value=omr_prev, disabled=hay_procesadas,
-            help="Método principal de esta app: mide directamente qué tan oscura está cada burbuja "
-                 "(visión clásica, sin llamar a la API). Claude NUNCA lee ni confirma burbujas de "
-                 "respuestas — solo transcribe nombre/RUT de la cabecera, una tarea aparte. Las "
-                 "preguntas que el motor no logra determinar con confianza quedan marcadas como "
-                 "dudosas, con el recorte de esa fila, para que las corrijas a mano en **Revisar y "
-                 "corregir** — nunca se adivina ni se reemplaza con una respuesta de IA.",
+            help="Mide directamente qué tan oscura está cada burbuja (sin llamar a la API). Claude "
+                 "nunca lee burbujas, solo transcribe nombre/RUT. Lo que el motor no logra determinar "
+                 "con confianza queda dudoso, con su recorte, para corregir a mano — nunca se adivina.",
         )
         if hay_procesadas:
             st.caption("🔒 Bloqueado: ya hay hojas procesadas con este motor. Usa **Limpiar todo** antes de cambiarlo.")
         elif omr_nuevo != omr_prev:
             st.session_state["usar_omr"] = omr_nuevo
             st.rerun()
-        if st.session_state["usar_omr"]:
-            st.caption("🔬 **Configuración recomendada.** Las respuestas son 100% del motor OMR — Claude solo "
-                       "transcribe nombre/RUT. Las dudosas quedan con su recorte listo para revisar a mano en "
-                       "**Revisar y corregir**. Si el motor no logra leer una hoja (foto poco clara, columnas "
-                       "cortadas), esa hoja queda entera para completar a mano — nunca se rellena con IA.")
-        else:
-            st.caption("🤖 Modo 100% IA (el que usaba la app antes del motor OMR) — Claude lee las burbujas "
-                       "directamente. Más lento, más caro por hoja, y menos confiable según lo probado. Útil "
-                       "solo para comparar o si el motor OMR falla repetido con tus fotos.")
+        if not st.session_state["usar_omr"]:
+            st.caption("🤖 Modo 100% IA: más lento, más caro y menos confiable — solo para comparar.")
     st.markdown("---")
     if st.button("🗑️ Limpiar todo", use_container_width=True):
         nn = st.session_state["n_preguntas"]
@@ -938,9 +942,7 @@ tab_pauta, tab_cargar, tab_revisar, tab_exportar = st.tabs([
 # ══ PAUTA ════════════════════════════════════════════════════════════
 with tab_pauta:
     st.markdown(f"### Respuestas correctas — {n} preguntas")
-    st.caption("💡 Recomendado: usa **Importar rápido** a la derecha (pega todas las respuestas de una vez) "
-               "— es más rápido y evita el parpadeo/reseteo que puede ocurrir al editar celda por celda muy "
-               "rápido en la tabla. Usa la tabla solo para corregir 1 o 2 celdas puntuales.")
+    st.caption("💡 Usa **Importar rápido** para pegar todas de una vez; la tabla solo para corregir 1-2 celdas.")
     col_t, col_i = st.columns([2, 1], gap="large")
 
     with col_i:
@@ -1014,47 +1016,28 @@ with tab_cargar:
             if modo_actual == "solo_respuestas":
                 st.markdown("""
 1. Escanea el QR o entra a la URL en el navegador del celular
-2. Toca **Cargar fotos** arriba
-3. Toca **Upload** → elige **Cámara** o **Galería**
-4. **Recorta o encuadra la foto para que muestre SOLO el bloque RESPUESTAS**, sin la
-   cabecera de nombre/RUT — que ocupe todo el encuadre, sin mesa ni fondo alrededor
-5. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
-6. Sube varias antes de procesar; nombre y RUT los completas a mano después
+2. **Cargar fotos** → **Upload** → Cámara o Galería
+3. Encuadra **solo el bloque RESPUESTAS completo** (las 4 columnas, sin cabecera), foto
+   derecha y con buena luz
+4. Sube varias antes de procesar; nombre y RUT se completan a mano después
 """)
             else:
                 st.markdown("""
 1. Escanea el QR o entra a la URL en el navegador del celular
-2. Toca **Cargar fotos** arriba
-3. Toca **Upload** → elige **Cámara** o **Galería**
-4. **Acerca el celular a la hoja** hasta que ocupe todo el encuadre (sin mesa, ropa
-   ni pies alrededor) — con 80 preguntas cada burbuja es diminuta, así que entre
-   más grande se vea la hoja en la foto, más fácil es distinguir cuál está marcada
-5. **Que se vean las 4 columnas completas del bloque RESPUESTAS** — si la foto corta
-   una columna, esa hoja no se puede leer por OMR y se procesa más lento (solo IA)
-6. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
-7. Sube varias antes de procesar
+2. **Cargar fotos** → **Upload** → Cámara o Galería
+3. Acerca la cámara a la hoja completa, con **las 4 columnas de RESPUESTAS visibles**,
+   foto derecha y con buena luz
+4. Sube varias antes de procesar
 """)
     else:
-        st.info("Desde el celular: entra a la URL de esta app en el navegador. "
-                "Al tocar Upload el celular ofrece abrir la cámara directamente. "
-                "Agrega `APP_URL` a Secrets de Streamlit Cloud para ver un QR aquí.")
+        st.info("Desde el celular: entra a la URL de esta app; al tocar Upload ofrece abrir la "
+                "cámara directamente. Agrega `APP_URL` a Secrets para ver un QR aquí.")
 
     st.markdown("---")
     st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
-    st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
-               "cada una queda guardada aunque la cámara se abra de nuevo.")
-    if modo_actual == "solo_respuestas":
-        st.caption("✂️ **Clave para que el motor OMR lea bien:** la foto debe mostrar el bloque RESPUESTAS "
-                   "COMPLETO (las 4 columnas, sin cabecera de nombre/RUT), encuadrada derecha, sin fondo "
-                   "alrededor y con buena luz.")
-    else:
-        st.caption("📸 **Clave para que el motor OMR lea bien:** acerca la cámara y llena el encuadre con la "
-                   "hoja completa, con las 4 columnas de RESPUESTAS visibles, foto derecha y con buena luz — "
-                   "sin fondo alrededor. La IA solo entra a apoyar en las preguntas puntuales donde el motor "
-                   "OMR queda con dudas, así que la calidad de la foto sigue importando.")
-    st.caption("💡 Recomendado: procesa de a **15–20 fotos por lote** (no 40–80 de una vez). "
-               "Así el progreso no se pierde si el celular se bloquea o hay corte de conexión, "
-               "y luego puedes exportar cada lote y unirlos en un Excel maestro.")
+    st.caption("Clave para que el motor OMR lea bien: las 4 columnas de RESPUESTAS visibles, foto "
+               "derecha, buena luz, sin fondo alrededor.")
+    st.caption("💡 Procesa de a **15–20 fotos por lote** — si se corta la conexión, no pierdes el resto.")
     archivos = st.file_uploader("Fotos", type=["jpg","jpeg","png","webp"],
                                  accept_multiple_files=True, label_visibility="collapsed",
                                  key="uploader_fotos")
@@ -1172,11 +1155,9 @@ with tab_revisar:
         m4.metric("🚨 Patrón sospechoso", sospechosas)
         m5.metric("🆔 Sin identificar", sin_id)
         if sospechosas:
-            st.error(f"🚨 {sospechosas} hoja(s) con un patrón de respuestas estadísticamente inverosímil "
-                     "(revisadas dos veces por la IA y aun así el resultado es raro). Ábrelas más abajo y "
-                     "compáralas manualmente con la foto original antes de confiar en su puntaje.")
+            st.error(f"🚨 {sospechosas} hoja(s) con un patrón sospechoso o no leída — revísalas abajo antes de confiar en su puntaje.")
         if sin_id:
-            st.warning(f"🆔 {sin_id} hoja(s) sin apellido, nombre ni cédula — complétalas más abajo antes de exportar.")
+            st.warning(f"🆔 {sin_id} hoja(s) sin identificar — complétalas abajo antes de exportar.")
         st.markdown("---")
 
         for arch, datos_orig in st.session_state.resultados.items():
@@ -1215,19 +1196,15 @@ with tab_revisar:
                 if omr_meta and omr_meta.get("usado"):
                     n_total = len(ref)
                     pct_omr = round(omr_meta["n_confiable"] / n_total * 100) if n_total else 0
-                    st.caption(
-                        f"🔬 Motor OMR (única fuente de las respuestas): **{pct_omr}%** confiable sin revisión "
-                        f"({omr_meta['n_confiable']}/{n_total}) · {omr_meta['n_dudosas']} para revisar a mano abajo"
-                    )
+                    st.caption(f"🔬 **{pct_omr}%** confiable ({omr_meta['n_confiable']}/{n_total}) · "
+                               f"{omr_meta['n_dudosas']} para revisar abajo")
                     if datos_orig.get("omr_diagnostico_bytes"):
-                        with st.expander("🔬 Ver diagnóstico OMR (qué burbuja detectó y con qué confianza)"):
-                            st.caption("🟢 confiable  ·  🟡 confianza media (revisar)  ·  🔴 dudosa (revisar)  ·  ⚪ en blanco")
+                        with st.expander("🔬 Ver diagnóstico OMR"):
+                            st.caption("🟢 confiable · 🟡 confianza media · 🔴 dudosa · ⚪ en blanco")
                             st.image(datos_orig["omr_diagnostico_bytes"], use_container_width=True)
                 elif omr_meta and not omr_meta.get("usado"):
-                    st.error(f"🔬 El motor OMR no pudo leer esta hoja ({omr_meta.get('motivo_fallback','?')}). "
-                             f"Las {n} preguntas quedaron sin resolver — complétalas a mano abajo, o vuelve a "
-                             "tomar la foto asegurándote de que se vean las 4 columnas de RESPUESTAS completas "
-                             "y súbela de nuevo.")
+                    st.error(f"🔬 No se pudo leer con OMR ({omr_meta.get('motivo_fallback','?')}). "
+                             "Completa a mano abajo o vuelve a tomar la foto con las 4 columnas visibles.")
 
                 # ── Datos editables del alumno ──────────────────────
                 if datos_orig.get("solo_respuestas"):
@@ -1272,10 +1249,7 @@ with tab_revisar:
                     st.markdown("---")
                     st.markdown(f"**Preguntas dudosas:** {', '.join(f'P{d}' for d in dudosas)}")
                     crops_dudosas = datos_orig.get("omr_crops_dudosas", {})
-                    if crops_dudosas:
-                        st.caption("Mira el recorte de cada fila (tal como lo vio el motor OMR) y elige la "
-                                   "respuesta correcta — no hace falta volver a la foto original:")
-                    else:
+                    if not crops_dudosas:
                         st.caption("Selecciona la respuesta correcta para cada una:")
 
                     # Renderizar en grupos de 6 (menos que antes: ahora cada columna
@@ -1362,13 +1336,9 @@ with tab_exportar:
                   delta_color="inverse" if sin_id_exp else "normal")
 
         if sospechosas_exp:
-            st.error(f"🚨 {sospechosas_exp} hoja(s) con patrón de respuestas estadísticamente inverosímil — "
-                     "revísalas en **Revisar y corregir** antes de confiar en el Excel. Quedan marcadas en la "
-                     "columna 'Alerta calidad' del Resumen igualmente.")
+            st.error(f"🚨 {sospechosas_exp} hoja(s) sospechosa(s) o no leída(s) — revísalas en **Revisar y corregir**.")
         if sin_id_exp:
-            st.warning(f"🆔 {sin_id_exp} hoja(s) sin apellido, nombre ni cédula — el Excel las mostrará en blanco "
-                       "en esas columnas. Complétalas en **Revisar y corregir** antes de exportar si necesitas "
-                       "identificar a cada alumno.")
+            st.warning(f"🆔 {sin_id_exp} hoja(s) sin identificar — quedarán en blanco en el Excel.")
         if pend_exp:
             st.warning(f"⚠️ {pend_exp} alumno(s) con dudas sin corregir — quedarán en amarillo.")
         elif not sospechosas_exp and not sin_id_exp:
@@ -1382,18 +1352,5 @@ with tab_exportar:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary", use_container_width=True,
         )
-        st.markdown("---")
-        st.markdown("""
-El Excel incluye 4 hojas:
-- **Resumen** — puntaje y % de logro por alumno, con columna **Curso** en cada fila:
-  puedes copiar y pegar las filas de varios Excel descargados en un mismo archivo
-  maestro y luego filtrar/ordenar por Curso o por alumno (Ap. Paterno / Nombres).
-- **Detalle respuestas** — cada pregunta en verde ✅ / rojo ❌ / amarillo ⚠️
-- **Estadísticas del curso** — promedio, máximo, mínimo y distribución
-- **Pauta utilizada** — registro de las respuestas correctas usadas
-
-**Recomendación:** procesa las fotos en lotes de ~15–20 antes de exportar,
-en vez de subir 40–80 de una vez. Puedes exportar el Excel parcial de cada
-lote y luego pegarlas todas en el archivo maestro — así no pierdes avance
-si el celular se bloquea o la conexión se corta a mitad de un lote grande.
-""")
+        st.caption("El Excel incluye Resumen, Detalle de respuestas, Estadísticas y Pauta utilizada — "
+                   "la columna **Curso** en Resumen permite unir varios exports en un archivo maestro.")
