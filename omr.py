@@ -1,9 +1,12 @@
 """
 Motor OMR (Optical Mark Recognition) para la plantilla "PLANTILLA DE HOJA DE
 RESPUESTAS" — detecta automaticamente que alternativa (A-E) marco el estudiante
-en cada fila de la tabla RESPUESTAS, sin depender de Claude Vision para los casos
-claros. Solo las preguntas ambiguas (o de confianza media) se delegan a una
-segunda revision por IA, sobre un recorte pequeño de esa fila puntual.
+en cada fila de la tabla RESPUESTAS. Este motor es la ÚNICA fuente de las
+respuestas: Claude Vision NUNCA lee ni confirma burbujas (la app la usa solo
+para transcribir nombre/RUT de la cabecera, una tarea completamente aparte).
+Las preguntas que el motor no logra determinar con confianza quedan como
+"dudosas" para que la persona las revise a mano en la app -- ninguna IA
+adivina ni corrige una lectura de burbujas.
 
 Diseño: en vez de coordenadas de pixel fijas (fragil ante fotos de celular con
 angulos/distancias distintas), todo se deriva de la propia imagen:
@@ -54,24 +57,25 @@ THRESHOLDS = {
     # margen minimo entre la mejor y la segunda mejor alternativa para no
     # considerarlo ambiguo/empate
     "AMBIGUOUS_MARGIN": 0.15,
-    # margen a partir del cual se considera alta confianza (usar OMR directo,
-    # sin pasar por IA)
+    # margen a partir del cual se considera alta confianza (se usa directo, sin
+    # marcar la pregunta como dudosa)
     "HIGH_CONFIDENCE_MARGIN": 0.30,
     # si dos alternativas superan este nivel de oscurecimiento ambas, se
     # considera "doble marca" aunque el margen entre ellas sea alto
     "DOUBLE_MARK_THRESHOLD": 0.55,
     # una pregunta "sin_marca" con omr_confidence por ENCIMA de este valor (pero
     # aun por debajo de MIN_MARK_SCORE) se trata como "posible marca muy débil"
-    # y se manda igual a revisión por IA, en vez de asumir en silencio que está
-    # en blanco
+    # y se marca igual como dudosa para revisión manual, en vez de asumir en
+    # silencio que está en blanco
     "BLANK_REVIEW_MARGIN": 0.12,
 }
 
 N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
 LETRAS = ["A", "B", "C", "D", "E"]
 
-# Estados que NO se consideran resueltos de forma confiable por OMR y por lo
-# tanto son candidatos a segunda revision por IA.
+# Estados que el motor NO logra resolver con confianza total y por lo tanto
+# quedan marcados como "dudosos" para revisión manual de la persona (nunca se
+# le pide a una IA que decida por el motor).
 ESTADOS_REVISABLES = {"ambiguo", "doble_marca", "sin_marca", "confianza_media"}
 
 
@@ -361,7 +365,7 @@ def recortar_pregunta(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers,
 COLOR_ALTA = (60, 180, 60)      # verde (BGR)
 COLOR_MEDIA = (0, 200, 230)     # amarillo/naranjo
 COLOR_AMBIGUA = (40, 40, 220)   # rojo
-COLOR_IA = (210, 130, 20)       # azul (revisada/confirmada por IA)
+COLOR_BLANCO = (150, 150, 150)  # gris (sin marca, con confianza suficiente para no ser dudosa)
 
 def anotar_diagnostico(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers, radio: float,
                         resultados: list, offset_pregunta: int = 0, escala: int = 3) -> np.ndarray:
@@ -383,11 +387,10 @@ def anotar_diagnostico(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers
         status = r["status"]
         color = {
             # estados crudos del clasificador OMR (uso directo del motor)
-            "alta_confianza": COLOR_ALTA, "confianza_media": COLOR_MEDIA,
-            # estados del pipeline híbrido (metodo_por_pregunta en app_revisor.py)
-            "omr": COLOR_ALTA, "omr_confirmado_ia": COLOR_ALTA,
-            "ia": COLOR_IA, "conflicto": COLOR_AMBIGUA,
-            "omr_no_confirmado": COLOR_AMBIGUA, "sin_resolver": COLOR_AMBIGUA,
+            "alta_confianza": COLOR_ALTA, "confianza_media": COLOR_MEDIA, "sin_marca": COLOR_BLANCO,
+            # metodo_por_pregunta del pipeline en app_revisor.py (todo resuelto por OMR, nunca por IA)
+            "confiable": COLOR_ALTA, "revisar_media": COLOR_MEDIA,
+            "revisar_dudoso": COLOR_AMBIGUA, "blanco": COLOR_BLANCO,
         }.get(status, COLOR_AMBIGUA)
         if r["letra"]:
             li = LETRAS.index(r["letra"])
@@ -435,11 +438,19 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4) 
     y_centers_por_banda, band_x_centers, radio = ajustar_grilla(body_gray, bands)
     scores = calcular_puntajes(body_gray, y_centers_por_banda, band_x_centers, radio)
 
-    all_vals = np.array([v for s in scores for v in s.values()])
-    baseline = float(np.percentile(all_vals, 15))
-    peak = float(np.percentile(all_vals, 97))
-
-    resultados = [clasificar_pregunta(s, baseline, peak) for s in scores]
+    # baseline/peak POR BANDA, no globales: una foto de celular casi siempre tiene
+    # iluminación despareja de un lado a otro de la hoja (sombra de la mano, ángulo
+    # de la luz), así que "qué tan oscuro es el papel en blanco" puede variar de una
+    # columna a otra. Calcularlo por banda evita que una columna más oscura por
+    # iluminación (no por tinta) se lea sistemáticamente distinto a las demás.
+    n_filas = len(y_centers_por_banda[0])
+    resultados = []
+    for bi in range(len(band_x_centers)):
+        banda_scores = scores[bi * n_filas:(bi + 1) * n_filas]
+        banda_vals = np.array([v for s in banda_scores for v in s.values()])
+        baseline = float(np.percentile(banda_vals, 15))
+        peak = float(np.percentile(banda_vals, 97))
+        resultados.extend(clasificar_pregunta(s, baseline, peak) for s in banda_scores)
 
     return {
         "body_bgr": body_bgr,
@@ -448,6 +459,4 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4) 
         "radio": radio,
         "n_bandas": len(bands),
         "resultados": resultados,      # uno por pregunta, orden banda por banda
-        "baseline": baseline,
-        "peak": peak,
     }

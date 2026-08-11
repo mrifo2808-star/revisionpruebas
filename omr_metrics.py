@@ -1,8 +1,9 @@
 """
 Harness de métricas para comparar 3 métodos de lectura de hojas de respuestas:
-  A) "ia"      — flujo 100% Claude Vision (app_revisor.procesar_imagen)
+  A) "ia"      — flujo 100% Claude Vision, Claude lee las burbujas (app_revisor.procesar_imagen)
   B) "omr"     — motor OMR puro, sin ninguna llamada a la API (omr.analizar_imagen)
-  C) "hibrido" — OMR + Claude Vision solo para preguntas ambiguas (app_revisor.procesar_imagen_hibrido)
+  C) "hibrido" — respuestas 100% del motor OMR; Claude solo transcribe nombre/RUT de la
+                 cabecera (nunca lee burbujas) (app_revisor.procesar_imagen_hibrido)
 
 Uso (requiere una API key de Anthropic solo para los métodos "ia" e "hibrido";
 "omr" no llama a la API y se puede correr sin key):
@@ -107,16 +108,16 @@ def correr_metodo_ia(app_module, cliente, datos_bytes: bytes, solo_respuestas: b
 
 
 def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
+    """Las respuestas son 100% del motor OMR; la única llamada a la API (si la hay) es
+    para transcribir nombre/RUT de la cabecera -- nunca para leer burbujas."""
     t0 = time.time()
     res = app_module.procesar_imagen_hibrido(cliente, "eval", datos_bytes, "image/jpeg", n, solo_respuestas)
     elapsed = time.time() - t0
     meta = res.get("omr_meta", {})
-    n_llamadas = 1 if meta.get("n_enviadas_ia") else 0  # revisión de ambiguas (1 llamada agrupada)
-    if not res.get("solo_respuestas"):
-        n_llamadas += 1  # llamada de identificación del alumno
+    n_llamadas = 0 if (res.get("solo_respuestas") or not meta.get("usado")) else 1  # solo identificación
     return {"respuestas": res["respuestas"], "tiempo_s": elapsed,
             "llamadas_api": n_llamadas,
-            "pct_resuelto_sin_ia": meta.get("n_omr_directo", 0) / n if n and meta.get("usado") else 0.0}
+            "pct_resuelto_sin_ia": meta.get("n_confiable", 0) / n if n and meta.get("usado") else 0.0}
 
 
 def _cargar_app_module():
@@ -134,10 +135,10 @@ def _cargar_app_module():
         end = start + len(f"def {nombre}") + (m.start() if m else len(rest))
         return src[start:end]
 
-    nombres = ["prompt_dinamico", "prompt_identificacion", "prompt_revision_ambiguas",
+    nombres = ["prompt_dinamico", "prompt_identificacion",
                "abrir_imagen_corregida", "preparar_imagenes", "mejorar_contraste_burbujas",
                "_img_a_b64_jpeg", "evaluar_sospecha", "_llamar_claude", "procesar_imagen",
-               "_bgr_a_jpeg_b64", "llamar_claude_identificacion", "llamar_claude_revision_ambiguas",
+               "_bgr_a_jpeg_b64", "llamar_claude_identificacion", "_crop_dudosa_b64_jpeg",
                "analizar_hoja_omr", "procesar_imagen_hibrido"]
     import io, base64, hashlib, json as _json
     from collections import Counter
