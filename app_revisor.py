@@ -116,7 +116,7 @@ def comprimir_imagen(datos_bytes: bytes, mime: str, lado_max: int = 1600, calida
         img = img.convert("RGB")
         if max(img.size) > lado_max:
             escala = lado_max / max(img.size)
-            img = img.resize((int(img.width*escala), int(img.height*escala)), Image.LANCZOS)
+            img = img.resize((int(img.width*escala), int(img.height*escala)), Image.Resampling.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=calidad, optimize=True)
         return buf.getvalue(), "image/jpeg"
@@ -168,9 +168,11 @@ def calcular(respuestas, pauta):
         else: inc += 1; err.append(i)
     return co, inc, om, err
 
+LETRAS_VALIDAS = {"A", "B", "C", "D", "E"}
+
 def pauta_desde_df(df: pd.DataFrame) -> list:
     return [
-        r.strip().upper() if r and r.strip().upper() in "ABCDE" else None
+        r.strip().upper() if r and r.strip().upper() in LETRAS_VALIDAS else None
         for r in df["Respuesta"].fillna("").tolist()
     ]
 
@@ -201,16 +203,16 @@ def generar_excel(pauta: list, curso: str) -> bytes:
     GR=PatternFill("solid",fgColor="F3F4F6")
     total_p = sum(1 for p in pauta if p)
 
-    # Hoja 1 — Resumen
+    # Hoja 1 — Resumen (sin celdas combinadas: cada fila es autocontenida para
+    # poder copiar/pegar y unificar varios Excel exportados en un archivo maestro,
+    # filtrando por Curso y por alumno)
     ws1 = wb.active; ws1.title = "Resumen"
-    if curso:
-        ws1["A1"] = f"Curso: {curso}"
-        ws1["A1"].font = Font(bold=True, size=13)
-        ws1.merge_cells("A1:M1")
-    enc = ["N°","Ap. Paterno","Ap. Materno","Nombres","Cédula","Folleto",
+    enc = ["Curso","N°","Ap. Paterno","Ap. Materno","Nombres","Cédula","Folleto",
            "Correctas","Incorrectas","Omitidas","Puntaje %",
            "Preguntas incorrectas","Dudosas corregidas"]
-    fe = 3
+    COL_PUNTAJE = 11
+    COLS_TEXTO = {1,3,4,5,6,7}
+    fe = 1
     for c,h in enumerate(enc,1):
         cell=ws1.cell(fe,c,h); cell.font=Font(bold=True,color="FFFFFF")
         cell.fill=AZ; cell.alignment=Alignment(horizontal="center",wrap_text=True)
@@ -224,7 +226,7 @@ def generar_excel(pauta: list, curso: str) -> bytes:
         dud = st.session_state.resultados[arch].get("dudosas",[])
         corr= st.session_state.correcciones.get(arch,{})
         cn  = len([k for k in corr if int(k) in dud])
-        vals=[rn,
+        vals=[curso or "—", rn,
               datos.get("apellido_paterno",""),datos.get("apellido_materno",""),
               datos.get("nombres",""),datos.get("cedula",""),datos.get("nro_folleto",""),
               co,inc,om,pct,
@@ -232,11 +234,12 @@ def generar_excel(pauta: list, curso: str) -> bytes:
               f"{cn} de {len(dud)}" if dud else "—"]
         for c,v in enumerate(vals,1):
             cell=ws1.cell(fe+rn,c,v); cell.border=bd
-            cell.alignment=Alignment(horizontal="center" if c>6 else "left",wrap_text=True)
-            if c==10: cell.fill=VE if pct>=70 else (AM if pct>=50 else RO)
-    for i,w in enumerate([4,16,16,22,14,9,10,11,10,10,38,18],1):
+            cell.alignment=Alignment(horizontal="left" if c in COLS_TEXTO else "center",wrap_text=True)
+            if c==COL_PUNTAJE: cell.fill=VE if pct>=70 else (AM if pct>=50 else RO)
+    for i,w in enumerate([20,4,16,16,22,14,9,10,11,10,10,38,18],1):
         ws1.column_dimensions[get_column_letter(i)].width=w
-    ws1.row_dimensions[fe].height=32
+    ws1.row_dimensions[fe].height=22
+    ws1.freeze_panes = "A2"
 
     # Hoja 2 — Detalle respuestas
     ws2 = wb.create_sheet("Detalle respuestas")
@@ -328,9 +331,15 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Número de preguntas**")
     n_prev = st.session_state["n_preguntas"]
+    hay_procesadas = bool(st.session_state["resultados"])
     n_nuevo = st.number_input("Preguntas", min_value=1, max_value=120,
-                               value=n_prev, step=1, label_visibility="collapsed")
-    if n_nuevo != n_prev:
+                               value=n_prev, step=1, label_visibility="collapsed",
+                               disabled=hay_procesadas)
+    if hay_procesadas:
+        st.caption("🔒 Bloqueado: ya hay hojas procesadas con este N°. "
+                   "Usa **Limpiar todo** antes de cambiarlo (cambiarlo a medio camino "
+                   "descuadra el puntaje de las hojas ya analizadas).")
+    elif n_nuevo != n_prev:
         st.session_state["n_preguntas"] = n_nuevo
         st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
         st.session_state["pauta"] = []
@@ -447,6 +456,9 @@ with tab_cargar:
     st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
     st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
                "cada una queda guardada aunque la cámara se abra de nuevo.")
+    st.caption("💡 Recomendado: procesa de a **15–20 fotos por lote** (no 40–80 de una vez). "
+               "Así el progreso no se pierde si el celular se bloquea o hay corte de conexión, "
+               "y luego puedes exportar cada lote y unirlos en un Excel maestro.")
     archivos = st.file_uploader("Fotos", type=["jpg","jpeg","png","webp"],
                                  accept_multiple_files=True, label_visibility="collapsed",
                                  key="uploader_fotos")
@@ -500,11 +512,11 @@ with tab_cargar:
                     res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n)
                     res["hash"] = foto["hash"]
                     st.session_state.resultados[id_unico] = res
+                    st.session_state.fotos_pendientes.pop(id_unico, None)
                 except anthropic.APITimeoutError:
-                    errs.append(f"{foto['nombre']}: tiempo de espera agotado (conexión lenta), reintenta.")
+                    errs.append(f"{foto['nombre']}: tiempo de espera agotado (conexión lenta) — quedó en la cola, reintenta.")
                 except Exception as e:
-                    errs.append(f"{foto['nombre']}: {e}")
-                st.session_state.fotos_pendientes.pop(id_unico, None)
+                    errs.append(f"{foto['nombre']}: {e} — quedó en la cola, reintenta.")
             prog.progress(1.0, text="¡Completado!")
             if errs: st.error("Errores:\n"+"\n".join(errs))
             else: st.success(f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
@@ -686,8 +698,15 @@ with tab_exportar:
         st.markdown("---")
         st.markdown("""
 El Excel incluye 4 hojas:
-- **Resumen** — puntaje y % de logro por alumno con datos corregidos
+- **Resumen** — puntaje y % de logro por alumno, con columna **Curso** en cada fila:
+  puedes copiar y pegar las filas de varios Excel descargados en un mismo archivo
+  maestro y luego filtrar/ordenar por Curso o por alumno (Ap. Paterno / Nombres).
 - **Detalle respuestas** — cada pregunta en verde ✅ / rojo ❌ / amarillo ⚠️
 - **Estadísticas del curso** — promedio, máximo, mínimo y distribución
 - **Pauta utilizada** — registro de las respuestas correctas usadas
+
+**Recomendación:** procesa las fotos en lotes de ~15–20 antes de exportar,
+en vez de subir 40–80 de una vez. Puedes exportar el Excel parcial de cada
+lote y luego pegarlas todas en el archivo maestro — así no pierdes avance
+si el celular se bloquea o la conexión se corta a mitad de un lote grande.
 """)
