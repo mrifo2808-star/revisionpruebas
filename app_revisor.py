@@ -71,11 +71,28 @@ OPCIONES = ["A", "B", "C", "D", "E", "—"]
 def prompt_dinamico(n: int) -> str:
     return f"""Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
 
-Examina la imagen con atención, pregunta por pregunta, en orden desde la P1 hasta la P{n}. No saltes ninguna.
-Para cada una, determina qué opción (A-E) marcó el estudiante, o null si no hay ninguna marca.
+PASO 1 — Entiende el layout antes de leer ninguna marca:
+Muchas hojas de respuestas chilenas NO son una sola lista de arriba hacia abajo: están organizadas en 2, 3 o
+4 columnas de preguntas puestas una al lado de la otra (por ejemplo, preguntas 1-20 en la primera columna,
+21-40 en la segunda, 41-60 en la tercera, etc). Antes de leer ninguna marca, identifica cuántas columnas de
+preguntas tiene esta hoja específica y en qué número empieza y termina cada una.
 
-Antes de responder, vuelve a mirar por segunda vez SOLO las preguntas donde no quedaste 100% seguro de cuál
-opción marcó el estudiante, y confírmalas con calma.
+PASO 2 — Usa el número IMPRESO, nunca el orden de lectura:
+Cada fila tiene un número de pregunta impreso junto a las burbujas A-E (ej. "21 (A)(B)(C)(D)(E)"). Ese número
+impreso es la única fuente de verdad sobre a qué pregunta corresponde esa fila — NO asumas que la fila que ves
+"más abajo" o "en la posición 21 según fuiste mirando" es la pregunta 21. Verifica el número impreso de cada
+fila antes de registrar su respuesta.
+
+PASO 3 — Registra cada respuesta en el índice correcto del arreglo:
+El arreglo "respuestas" tiene {n} posiciones, donde la posición 1 = pregunta impresa "1", la posición 2 =
+pregunta impresa "2", y así sucesivamente — sin importar en qué orden espacial las hayas ido mirando en la
+imagen (por columnas, no de arriba a abajo en un solo bloque).
+
+PASO 4 — Verifica antes de responder:
+Revisa que el arreglo "respuestas" tenga exactamente {n} elementos y que corresponda una posición por cada
+número de pregunta impreso en la hoja, del 1 al {n}, sin saltos ni desplazamientos. Luego, vuelve a mirar por
+segunda vez SOLO las preguntas donde no quedaste 100% seguro de cuál opción marcó el estudiante, y confírmalas
+con calma.
 
 Criterio simple para "dudosas" — marca una pregunta como dudosa ÚNICAMENTE si, tras esa segunda mirada, sigue
 existiendo un riesgo real de haber leído mal la intención del estudiante (ejemplos: dos opciones con marca
