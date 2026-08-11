@@ -11,11 +11,12 @@ import json
 import re
 import base64
 import hashlib
+from collections import Counter
 import qrcode
 import pandas as pd
 import streamlit as st
 import anthropic
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -27,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "1.5.0"
+VERSION_APP = "1.6.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -191,6 +192,17 @@ def _img_a_b64_jpeg(img: Image.Image, lado_max: int, calidad: int) -> str:
     img.save(buf, format="JPEG", quality=calidad, optimize=True)
     return base64.standard_b64encode(buf.getvalue()).decode()
 
+def mejorar_contraste_burbujas(img: Image.Image) -> Image.Image:
+    """
+    Solo para los acercamientos del bloque RESPUESTAS: pasar a escala de grises quita
+    ruido de color de la foto (sombras, tono del papel) y subir contraste + nitidez
+    separa más el gris del rayado a lápiz del blanco de la burbuja vacía. No se aplica
+    a la foto completa porque ahí conviene mantener el color para leer bien nombre/RUT.
+    """
+    img_gris = img.convert("L").convert("RGB")
+    img_contraste = ImageEnhance.Contrast(img_gris).enhance(1.8)
+    return ImageEnhance.Sharpness(img_contraste).enhance(2.0)
+
 def preparar_imagenes(datos_bytes: bytes, mime: str):
     """
     Claude redimensiona internamente cualquier imagen a un techo fijo de resolución
@@ -204,6 +216,12 @@ def preparar_imagenes(datos_bytes: bytes, mime: str):
     """
     try:
         img = Image.open(io.BytesIO(datos_bytes))
+        # Las fotos de celular suelen traer el tag EXIF "Orientation" en vez de venir
+        # realmente rotadas en los píxeles: sin corregir esto, la imagen puede llegar
+        # "acostada" 90°/180° a la API aunque se vea derecha en el celular, lo que
+        # desalinea por completo el recorte de cabecera/mitades de más abajo y produce
+        # lecturas erráticas de todo el bloque de respuestas.
+        img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
     except Exception:
         return [(base64.standard_b64encode(datos_bytes).decode(), mime)]
@@ -218,24 +236,47 @@ def preparar_imagenes(datos_bytes: bytes, mime: str):
     margen = 0.10  # superposición horizontal para no cortar una columna justo por la mitad
     mitad = w // 2
     overlap = int(w * margen)
-    izq = img.crop((0, top, min(w, mitad + overlap), h))
-    der = img.crop((max(0, mitad - overlap), top, w, h))
+    izq = mejorar_contraste_burbujas(img.crop((0, top, min(w, mitad + overlap), h)))
+    der = mejorar_contraste_burbujas(img.crop((max(0, mitad - overlap), top, w, h)))
     return [
         (completa, "image/jpeg"),
         (_img_a_b64_jpeg(izq, 1568, 92), "image/jpeg"),
         (_img_a_b64_jpeg(der, 1568, 92), "image/jpeg"),
     ]
 
-def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
-    imagenes = preparar_imagenes(datos_bytes, mime)
-    bloques_imagen = [
-        {"type":"image","source":{"type":"base64","media_type":mt,"data":data}}
-        for data, mt in imagenes
-    ]
+def evaluar_sospecha(res: dict) -> None:
+    """
+    Red de seguridad estadística: si el modelo se desalinea de fila/columna (p.ej. por
+    una foto rotada o muy inclinada) tiende a leer una franja completa como si fuera
+    siempre la misma burbuja, produciendo una letra que se repite muchísimo más de lo
+    que un patrón real de respuestas de examen permitiría. Esto no reemplaza la
+    revisión humana, pero evita que un resultado así de inverosímil pase inadvertido
+    como si fuera una lectura normal.
+    """
+    respuestas = res.get("respuestas", [])
+    no_nulas = [r.upper() for r in respuestas if r]
+    n_resp = len(no_nulas)
+    if n_resp == 0:
+        res["sospechoso"] = True
+        res["motivo_sospecha"] = "No se detectó ninguna respuesta marcada en toda la hoja."
+        return
+    letra_top, freq_top = Counter(no_nulas).most_common(1)[0]
+    proporcion = freq_top / n_resp
+    if n_resp >= 15 and proporcion >= 0.55:
+        res["sospechoso"] = True
+        res["motivo_sospecha"] = (
+            f"{round(proporcion*100)}% de las respuestas detectadas son '{letra_top}' "
+            f"({freq_top} de {n_resp}) — patrón inusual para un examen real, probable "
+            f"desalineación de fila/columna. Revisa esta hoja con la foto original.")
+    else:
+        res["sospechoso"] = False
+        res["motivo_sospecha"] = ""
+
+def _llamar_claude(cliente, bloques_imagen: list, n: int, num_imagenes: int, texto_extra: str = "") -> dict:
     msg = cliente.messages.create(
         model="claude-sonnet-5", max_tokens=6144,
         messages=[{"role":"user","content": bloques_imagen + [
-            {"type":"text","text":prompt_dinamico(n, len(imagenes))},
+            {"type":"text","text":prompt_dinamico(n, num_imagenes) + texto_extra},
         ]}],
     )
     if msg.stop_reason == "max_tokens":
@@ -248,11 +289,44 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int)
     if m:
         texto = m.group(0)
     res = json.loads(texto)
-    res["archivo"] = nombre
-    res["n_preguntas"] = n
     resp = res.get("respuestas", [])
     res["respuestas"] = (resp + [None]*n)[:n]
     res["dudosas"] = sorted(set(res.get("dudosas", [])))
+    return res
+
+REFUERZO_REINTENTO = (
+    "\n\nATENCIÓN: en un intento anterior de leer esta misma hoja, el patrón de respuestas "
+    "resultó estadísticamente inverosímil para un examen real (una misma letra se repitió "
+    "muchísimo más de lo esperable), lo que sugiere que te desalineaste de fila o de columna "
+    "en algún punto. Vuelve a examinar la hoja desde cero, con máximo cuidado, aplicando la "
+    "REGLA DE ORO fila por fila y verificando el número IMPRESO de cada fila antes de registrar "
+    "su respuesta.")
+
+def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
+    imagenes = preparar_imagenes(datos_bytes, mime)
+    bloques_imagen = [
+        {"type":"image","source":{"type":"base64","media_type":mt,"data":data}}
+        for data, mt in imagenes
+    ]
+    res = _llamar_claude(cliente, bloques_imagen, n, len(imagenes))
+    evaluar_sospecha(res)
+    intentos = 1
+    # Un solo reintento automático cuando el primer resultado se ve estadísticamente
+    # inverosímil: es barato (una llamada más) frente al costo de que el profesor
+    # confíe en un resultado erróneo sin darse cuenta.
+    if res["sospechoso"]:
+        res2 = _llamar_claude(cliente, bloques_imagen, n, len(imagenes), REFUERZO_REINTENTO)
+        evaluar_sospecha(res2)
+        intentos = 2
+        if not res2["sospechoso"]:
+            res = res2
+        elif res2.get("respuestas") != res.get("respuestas"):
+            # Ambos intentos siguen sospechosos: nos quedamos con el segundo (ya vio la
+            # advertencia) pero el flag queda encendido para que quede marcada a mano.
+            res = res2
+    res["archivo"] = nombre
+    res["n_preguntas"] = n
+    res["intentos"] = intentos
     return res
 
 def datos_efectivos(arch: str) -> dict:
@@ -320,9 +394,10 @@ def generar_excel(pauta: list, curso: str) -> bytes:
     ws1 = wb.active; ws1.title = "Resumen"
     enc = ["Curso","N°","Ap. Paterno","Ap. Materno","Nombres","Cédula","Folleto",
            "Correctas","Incorrectas","Omitidas","Puntaje %",
-           "Preguntas incorrectas","Dudosas corregidas"]
+           "Preguntas incorrectas","Dudosas corregidas","Alerta calidad"]
     COL_PUNTAJE = 11
-    COLS_TEXTO = {1,3,4,5,6,7}
+    COL_ALERTA = 14
+    COLS_TEXTO = {1,3,4,5,6,7,14}
     fe = 1
     for c,h in enumerate(enc,1):
         cell=ws1.cell(fe,c,h); cell.font=Font(bold=True,color="FFFFFF")
@@ -334,20 +409,24 @@ def generar_excel(pauta: list, curso: str) -> bytes:
         ref   = respuestas_efectivas(arch)
         co,inc,om,err = calcular(ref, pauta[:len(ref)])
         pct = round(co/total_p*100,1) if total_p else 0
-        dud = st.session_state.resultados[arch].get("dudosas",[])
+        res_orig = st.session_state.resultados[arch]
+        dud = res_orig.get("dudosas",[])
         corr= st.session_state.correcciones.get(arch,{})
         cn  = len([k for k in corr if int(k) in dud])
+        alerta = res_orig.get("motivo_sospecha","") if res_orig.get("sospechoso") else "—"
         vals=[curso or "—", rn,
               datos.get("apellido_paterno",""),datos.get("apellido_materno",""),
               datos.get("nombres",""),datos.get("cedula",""),datos.get("nro_folleto",""),
               co,inc,om,pct,
               ", ".join(str(e) for e in err) if err else "—",
-              f"{cn} de {len(dud)}" if dud else "—"]
+              f"{cn} de {len(dud)}" if dud else "—",
+              alerta]
         for c,v in enumerate(vals,1):
             cell=ws1.cell(fe+rn,c,v); cell.border=bd
             cell.alignment=Alignment(horizontal="left" if c in COLS_TEXTO else "center",wrap_text=True)
             if c==COL_PUNTAJE: cell.fill=VE if pct>=70 else (AM if pct>=50 else RO)
-    for i,w in enumerate([20,4,16,16,22,14,9,10,11,10,10,38,18],1):
+            if c==COL_ALERTA and alerta!="—": cell.fill=RO; cell.font=Font(bold=True,color="991B1B")
+    for i,w in enumerate([20,4,16,16,22,14,9,10,11,10,10,38,18,44],1):
         ws1.column_dimensions[get_column_letter(i)].width=w
     ws1.row_dimensions[fe].height=22
     ws1.freeze_panes = "A2"
@@ -679,10 +758,16 @@ with tab_revisar:
             1 for a,d in st.session_state.resultados.items()
             if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
         )
-        m1,m2,m3 = st.columns(3)
+        sospechosas = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
+        m1,m2,m3,m4 = st.columns(4)
         m1.metric("Alumnos procesados", total_alumnos)
         m2.metric("Con dudas pendientes", pendientes)
         m3.metric("Preguntas por prueba", n)
+        m4.metric("⚠️ Patrón sospechoso", sospechosas)
+        if sospechosas:
+            st.error(f"🚨 {sospechosas} hoja(s) con un patrón de respuestas estadísticamente inverosímil "
+                     "(revisadas dos veces por la IA y aun así el resultado es raro). Ábrelas más abajo y "
+                     "compáralas manualmente con la foto original antes de confiar en su puntaje.")
         st.markdown("---")
 
         for arch, datos_orig in st.session_state.resultados.items():
@@ -701,12 +786,15 @@ with tab_revisar:
             else:
                 puntaje_str = "_(sin pauta)_"
 
-            icono = "⚠️" if pend_este else "✅"
+            es_sospechoso = bool(datos_orig.get("sospechoso"))
+            icono = "🚨" if es_sospechoso else ("⚠️" if pend_este else "✅")
             with st.expander(
                 f"{icono} {datos.get('apellido_paterno','')} {datos.get('nombres','')} "
                 f"— {datos.get('cedula','')} | {puntaje_str}",
-                expanded=bool(pend_este)
+                expanded=bool(pend_este or es_sospechoso)
             ):
+                if es_sospechoso:
+                    st.error(f"🚨 **Patrón sospechoso:** {datos_orig.get('motivo_sospecha','')}")
                 # ── Datos editables del alumno ──────────────────────
                 st.markdown("**Datos del alumno** *(edita si Claude leyó mal algún campo)*")
                 ie = st.session_state.info_edits.get(arch, {})
@@ -808,16 +896,24 @@ with tab_exportar:
             if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
         )
         total_p=sum(1 for p in pauta if p)
-        m1,m2,m3=st.columns(3)
+        sospechosas_exp = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
+        m1,m2,m3,m4=st.columns(4)
         m1.metric("Alumnos",len(st.session_state.resultados))
         m2.metric("Preguntas evaluadas",total_p)
         m3.metric("Dudas pendientes",pend_exp,
                   delta="revisar antes" if pend_exp else "todo resuelto",
                   delta_color="inverse" if pend_exp else "normal")
+        m4.metric("🚨 Sospechosas",sospechosas_exp,
+                  delta="revisar antes" if sospechosas_exp else "ninguna",
+                  delta_color="inverse" if sospechosas_exp else "normal")
 
+        if sospechosas_exp:
+            st.error(f"🚨 {sospechosas_exp} hoja(s) con patrón de respuestas estadísticamente inverosímil — "
+                     "revísalas en **Revisar y corregir** antes de confiar en el Excel. Quedan marcadas en la "
+                     "columna 'Alerta calidad' del Resumen igualmente.")
         if pend_exp:
             st.warning(f"⚠️ {pend_exp} alumno(s) con dudas sin corregir — quedarán en amarillo.")
-        else:
+        elif not sospechosas_exp:
             st.success("✅ Todo revisado. El Excel estará completo.")
 
         nombre_xl=f"resultados_{curso.replace(' ','_') if curso else 'curso'}.xlsx"
