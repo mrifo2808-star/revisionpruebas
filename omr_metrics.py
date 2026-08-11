@@ -193,6 +193,7 @@ def correr_metodo_omr(app_module, datos_bytes: bytes, solo_respuestas: bool, n: 
             "tiempo_s": elapsed, "llamadas_api": 0, "n_api_calls_identification": 0, "n_api_calls_answer_arbitration": 0,
             "pct_resuelto_sin_ia": n_directo / n if n else 0.0,
             "geometry_confidence_por_banda": salida.get("geometry_confidence_por_banda", []),
+            "row_alignment_confidence_por_banda": salida.get("row_alignment_confidence_por_banda", []),
             "n_geometry_error": n_geo_error}
 
 
@@ -235,6 +236,7 @@ def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuest
             "n_answers_unresolved": meta.get("n_answers_unresolved", 0),
             "pct_resuelto_sin_ia": meta.get("n_confiable", 0) / n if n and meta.get("usado") else 0.0,
             "geometry_confidence_por_banda": meta.get("geometry_confidence_por_banda", []),
+            "row_alignment_confidence_por_banda": meta.get("row_alignment_confidence_por_banda", []),
             "n_geometry_error": meta.get("n_geometry_error", 0),
             "n_geometry_warning": meta.get("n_geometry_warning", 0)}
 

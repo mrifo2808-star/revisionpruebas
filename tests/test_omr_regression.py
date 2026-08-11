@@ -87,13 +87,25 @@ def test_uso_exclusivo_nunca_confiable(app):
     assert "confiable" not in metodos, \
         f"FALLO CRITICO: alguna pregunta se dio como 'confiable' en una foto con geometria via fallback: {Counter(metodos)}"
 
-    # Deben existir exactamente 4 bandas, todas con geometry_confidence por
-    # encima de 0 (ninguna completamente vacia/sin evidencia real) -- ver
-    # tests/test_omr_band_selection.py para el test dedicado de que las 4
-    # columnas reales quedan correctamente identificadas y el texto vecino
-    # excluido, en vez de fusionado con alguna de ellas.
+    # Deben existir exactamente 4 bandas -- ver tests/test_omr_band_selection.py
+    # para el test dedicado de que las 4 columnas reales quedan correctamente
+    # identificadas y el texto vecino excluido, en vez de fusionado con alguna
+    # de ellas.
+    #
+    # NOTA (row lattice v4.1): antes de este cambio se exigia geometry_confidence
+    # > 0 en las 4 bandas como proxy de "ninguna banda completamente vacia" --
+    # ese numero se armaba solo con ancho/invariantes/fuente de columnas, sin
+    # señal real de si las FILAS estaban bien alineadas. Ahora row_alignment_confidence
+    # entra como quinto factor fail-closed (item 17 del plan): en esta foto real
+    # cada banda tiene evidencia Hough genuina pero escasa (~11-24 circulos de
+    # ~100 esperados) y los centros de columna vienen de UNIFORM_FALLBACK (no de
+    # kmeans real), asi que el soporte fila-por-columna no alcanza el piso minimo
+    # para confirmar alineacion -- geometry_confidence baja a 0.0 en las 4 bandas,
+    # correctamente, en vez de fingir una confianza que la evidencia no respalda.
+    # Lo que de verdad importa (ninguna respuesta "confiable" en una foto dificil)
+    # ya se valido arriba y sigue intacto.
     assert len(geo_conf) == 4, f"se esperaban 4 bandas, se obtuvieron {len(geo_conf)}"
-    assert all(g > 0 for g in geo_conf), f"alguna banda quedo con geometry_confidence 0 (vacia): {geo_conf}"
+    assert all(0.0 <= g <= 1.0 for g in geo_conf), f"geometry_confidence fuera de rango: {geo_conf}"
     print("OK -- ninguna pregunta se dio como 'confiable' en esta foto dificil\n")
 
 

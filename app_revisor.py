@@ -101,6 +101,22 @@ OMR_THRESHOLDS = {
                                           # para que un diagnóstico visual la destaque
 }
 OMR_N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
+
+# Feature flag: el NUMBER LATTICE (segundo sensor geométrico sobre los
+# números de fila impresos, ver omr_ajustar_number_lattice) se calcula y se
+# expone SIEMPRE en diagnóstico, pero su veto sobre geometry_confidence
+# arranca OFF por defecto. Motivo medido, no preventivo: en la foto de
+# calibración (el fixture con ground truth más confiable que hay) el
+# crosscheck disparó un falso positivo -- el dígito "1" de la fila 1 es
+# demasiado delgado para producir tinta detectable a la resolución de
+# detección (~480px de ancho de tabla), así que el lattice de números quedó
+# corrido una fila completa contra el de burbujas (que sí es correcto,
+# verificado contra ground truth) y hubiera tirado geometry_confidence de
+# una banda sana a GEOMETRY_ERROR. Mismo criterio que AI_ROW_ANCHOR_CHECK
+# (plan item 20): no se habilita un veto adicional sin evidencia de que
+# aporta más de lo que arriesga -- requiere muestrear la franja de números a
+# mayor resolución antes de poder usarse como gate real.
+NUMBER_LATTICE_CROSSCHECK_HABILITADO = False
 OMR_LETRAS = ["A", "B", "C", "D", "E"]
 
 # Perfil de la plantilla física impresa. Existe para que el N máximo de
@@ -417,6 +433,475 @@ def _omr_y_centers_uniforme(bh, n_filas):
     return np.linspace(margen_y, bh - margen_y, n_filas)
 
 
+# ─────────────────────────── ROW LATTICE (v4.1) ───────────────────────────
+# Reemplaza la asignación de los 20 centros de fila por kmeans 1D
+# independiente (que no sabe que las filas impresas forman una estructura
+# periódica y puede desplazar/duplicar/perder clusters, produciendo drift
+# vertical acumulado dentro de una banda) por un modelo de grilla regular:
+#
+#     y(i) = y0 + i*dy      i = 0..n_filas-1
+#
+# y0 y dy se estiman de forma robusta a partir de los círculos Hough
+# detectados en la banda (evidencia), no al revés -- los círculos NUNCA
+# definen los 20 centros libremente, solo informan el origen y el período de
+# una estructura que la plantilla impresa ya fija de antemano. Sobre esa
+# grilla global se permite un microajuste local pequeño (±0.28*dy por fila,
+# regularizado con una penalización de suavidad vía programación dinámica)
+# para tolerar curvatura/perspectiva residual sin permitir que una fila
+# individual se desplace lo suficiente como para ocupar la posición de otra.
+def _omr_cluster_1d_ordenado(values_sorted, gap_min):
+    """Agrupa un array 1D YA ordenado ascendente en clusters: un corte nuevo
+    cuando el hueco entre valores consecutivos es >= gap_min. Devuelve una
+    lista de (centro, n_puntos) en orden creciente de posición. Sirve tanto
+    para estimar el período (dy) como para ubicar el origen (y0) de la
+    grilla -- las burbujas A-E de una misma fila física caen todas dentro
+    del mismo cluster porque su Y es casi idéntica."""
+    if len(values_sorted) == 0:
+        return []
+    clusters = []
+    start = 0
+    for i in range(1, len(values_sorted)):
+        if values_sorted[i] - values_sorted[i - 1] >= gap_min:
+            grp = values_sorted[start:i]
+            clusters.append((float(grp.mean()), int(len(grp))))
+            start = i
+    grp = values_sorted[start:]
+    clusters.append((float(grp.mean()), int(len(grp))))
+    return clusters
+
+
+def _omr_estimar_dy_robusto(y_sorted, bh, n_filas, dy_esperado):
+    """Estima el período vertical (dy) real entre filas a partir de las
+    detecciones Hough de la banda, sin asumir que el primer/último círculo
+    encontrado define nada. Método: agrupar en clusters de fila (ver arriba),
+    tomar la mediana de las diferencias entre clusters consecutivos que caen
+    en un rango plausible de "una fila" (0.5x a 1.6x el dy esperado por
+    plantilla -- filtra huecos de 2+ filas por detecciones perdidas), y
+    refinar una segunda vez con ese dy ya más preciso como umbral de
+    clustering. Como señal adicional, contrasta contra dy implícito en el
+    span primera-última fila detectada (item 14 del plan: evita que el error
+    se acumule silenciosamente entre filas intermedias).
+
+    Devuelve (dy, n_clusters_soporte, diagnostico). Si no hay evidencia
+    suficiente para una estimación confiable, devuelve dy_esperado (prior de
+    plantilla) sin fingir precisión que los datos no respaldan."""
+    diag = {}
+    gap_min0 = max(2.0, 0.45 * dy_esperado)
+    clusters0 = _omr_cluster_1d_ordenado(y_sorted, gap_min0)
+    centers0 = np.array([c for c, _n in clusters0])
+    if len(centers0) < 3:
+        return dy_esperado, len(centers0), {"motivo": "pocos_clusters_iniciales"}
+
+    diffs0 = np.diff(centers0)
+    validos0 = diffs0[(diffs0 >= 0.5 * dy_esperado) & (diffs0 <= 1.6 * dy_esperado)]
+    dy1 = float(np.median(validos0)) if len(validos0) >= 3 else dy_esperado
+
+    gap_min1 = max(2.0, 0.45 * dy1)
+    clusters1 = _omr_cluster_1d_ordenado(y_sorted, gap_min1)
+    centers1 = np.array([c for c, _n in clusters1])
+    diffs1 = np.diff(centers1)
+    validos1 = diffs1[(diffs1 >= 0.5 * dy1) & (diffs1 <= 1.6 * dy1)]
+    dy2 = float(np.median(validos1)) if len(validos1) >= 3 else dy1
+
+    dy_final = dy2
+    if len(centers1) >= 2:
+        span = centers1[-1] - centers1[0]
+        k = max(1, round(span / dy2)) if dy2 > 0 else 1
+        dy_span = span / k
+        if dy_span > 0 and abs(dy_span - dy2) / dy2 < 0.25:
+            dy_final = float(np.median([dy2, dy_span]))
+        else:
+            diag["desacuerdo_periodo"] = True  # ROW_PERIOD_ERROR: ver item 32
+
+    return dy_final, len(centers1), diag
+
+
+def _omr_estimar_y0_robusto(cluster_centers, dy, bh, n_filas, margen_frac=0.02):
+    """Ubica el origen (y0, posición de la fila índice 0) usando la FASE
+    circular de todos los clusters de fila detectados módulo dy (promedio
+    circular -- robusto a outliers y no depende de "cuál círculo se detectó
+    primero"), y ancla el múltiplo de dy correcto al margen superior
+    esperado por la plantilla impresa (item 9: no basarse exclusivamente en
+    el primer círculo encontrado ni en un porcentaje arbitrario aislado --
+    acá el porcentaje de margen solo desempata ENTRE múltiplos de un período
+    ya demostrado por evidencia real, no reemplaza la evidencia).
+
+    El múltiplo elegido SIEMPRE debe dejar las n_filas físicas dentro de la
+    banda (con un margen chico de tolerancia): un y0 que deja la fila 0 antes
+    del borde superior, o la fila n_filas-1 después del inferior, no puede
+    ser correcto -- no existe tinta impresa fuera de la banda. Sin este
+    límite explícito, la fase circular por sí sola puede "empatar" entre dos
+    múltiplos consecutivos de dy y quedarse con uno que saca la grilla de la
+    banda por una fracción de fila (bug real, encontrado en smoke test con
+    fotos reales: y0 <= -1px), lo que dispara los invariantes geométricos
+    duros (centro_fuera_de_banda) y tira geometry_confidence a 0 innecesariamente."""
+    if len(cluster_centers) == 0 or dy <= 0:
+        return bh * margen_frac
+    centers = np.asarray(cluster_centers, dtype=np.float64)
+    phases = np.mod(centers, dy)
+    angles = phases / dy * 2 * np.pi
+    mean_angle = np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
+    mean_phase = (mean_angle / (2 * np.pi)) * dy
+    if mean_phase < 0:
+        mean_phase += dy
+    y0_prior = bh * margen_frac
+    k = round((y0_prior - mean_phase) / dy)
+    y0 = mean_phase + k * dy
+
+    slack = dy * 0.5
+    y0_min, y0_max = -slack, bh - (n_filas - 1) * dy + slack
+    if y0_max < y0_min:  # banda mas baja que la grilla completa (dy sobreestimado): no hay margen valido
+        return float(np.clip(y0, -slack, bh + slack))
+    while y0 < y0_min:
+        y0 += dy
+    while y0 > y0_max:
+        y0 -= dy
+    return float(y0)
+
+
+def _omr_row_support(y_pred, x_centers, obs_xy, tol_y, tol_x):
+    """Soporte de una fila candidata: cuántas de las 5 columnas A-E tienen
+    evidencia visual (un círculo Hough real) cerca de (x_columna, y_pred).
+    Una fila real tiene A-E aproximadamente en el mismo Y (item 10) -- una
+    detección aislada en una sola columna no puede por sí sola desplazar una
+    fila completa. Devuelve un valor en [0, 5]."""
+    if len(obs_xy) == 0:
+        return 0.0
+    near_y = obs_xy[np.abs(obs_xy[:, 1] - y_pred) <= tol_y]
+    if len(near_y) == 0:
+        return 0.0
+    hits = 0
+    for xc in x_centers:
+        if np.any(np.abs(near_y[:, 0] - xc) <= tol_x):
+            hits += 1
+    return float(hits)
+
+
+def omr_ajustar_lattice_vertical(obs_xy, x_centers, bh, n_filas, radio_banda, dy_prior=None, min_obs_total=3):
+    """
+    Núcleo del row lattice: reemplaza los 20 centros de fila independientes
+    (antes kmeans 1D) por una grilla regular y(i) = y0 + i*dy + delta_i,
+    donde y0/dy se estiman de forma robusta a partir de evidencia real y
+    delta_i es un microajuste local acotado y suavizado (nunca "20 filas
+    ajustadas por separado y después ordenadas" -- ver items 6-13 del plan).
+
+    obs_xy: Nx2 array de (x, y) de círculos Hough detectados en esta banda
+      (evidencia observacional -- pueden faltar filas enteras o sobrar
+      outliers, la grilla NO depende de que estén todos).
+    x_centers: los 5 centros de columna A-E ya resueltos (horizontal, fuera
+      de alcance de este cambio).
+    dy_prior: dy_global compartido entre las 4 bandas del mismo formulario
+      (item 15) -- si el dy propio de esta banda se desvía demasiado o hay
+      poca evidencia local, se prioriza el período compartido.
+
+    Devuelve un dict: y_centers, y0, dy, row_support (uno por fila, 0..1),
+    row_offsets (delta_i en píxeles), row_alignment_confidence (0..1),
+    row_source ("ROBUST_LATTICE" | "LATTICE_INTERPOLATED" | "UNIFORM_FALLBACK"),
+    diagnostico (dict con violaciones/señales para error analysis).
+    """
+    obs_xy = np.asarray(obs_xy, dtype=np.float64).reshape(-1, 2) if len(obs_xy) else np.empty((0, 2))
+    x_centers = np.asarray(x_centers, dtype=np.float64)
+    dy_esperado = bh / n_filas
+    violaciones = []
+
+    if len(obs_xy) < min_obs_total:
+        y_centers = _omr_y_centers_uniforme(bh, n_filas)
+        return {
+            "y_centers": y_centers, "y0": float(y_centers[0]), "dy": dy_esperado,
+            "row_support": np.zeros(n_filas), "row_offsets": np.zeros(n_filas),
+            "row_alignment_confidence": 0.0, "row_source": "UNIFORM_FALLBACK",
+            "diagnostico": {"violaciones": ["banda_sin_evidencia_circulos_lattice"]},
+        }
+
+    y_sorted = np.sort(obs_xy[:, 1])
+    dy_local, n_clusters, dy_diag = _omr_estimar_dy_robusto(y_sorted, bh, n_filas, dy_esperado)
+    if "desacuerdo_periodo" in dy_diag:
+        violaciones.append("ROW_PERIOD_ERROR")
+
+    dy = dy_local
+    evidencia_debil = n_clusters < max(4, n_filas * 0.3)
+    if dy_prior and dy_prior > 0:
+        desvio = abs(dy_local - dy_prior) / dy_prior
+        if evidencia_debil or desvio > 0.12:
+            dy = dy_prior
+            if desvio > 0.12 and not evidencia_debil:
+                violaciones.append("dy_desvia_de_dy_global")
+
+    gap_min = max(2.0, 0.45 * dy)
+    clusters = _omr_cluster_1d_ordenado(y_sorted, gap_min)
+    cluster_centers = np.array([c for c, _n in clusters])
+    y0 = _omr_estimar_y0_robusto(cluster_centers, dy, bh, n_filas)
+
+    tol_y = max(2.0, 0.35 * dy)
+    tol_x = max(3.0, radio_banda * 1.6)
+
+    # Chequeo anti ROW_INDEX_SHIFT (item 16): en una hoja real hay un círculo
+    # IMPRESO en cada fila exista o no marca, así que la grilla es
+    # aproximadamente periódica de punta a punta -- comparar el soporte TOTAL
+    # de la ventana de 20 filas contra la ventana corrida ±1*dy es una señal
+    # débil a propósito (correr toda la ventana un puesto solo cambia CUÁL
+    # círculo real queda afuera en cada extremo, la enorme mayoría de las
+    # filas interiores "coincide" en ambos casos por diseño). La señal que sí
+    # distingue una ventana corrida de la correcta es LOCAL a los bordes: si
+    # hay evidencia real de una fila más allá de un extremo, más fuerte que
+    # la evidencia en ese extremo actual, la ventana entera está corrida.
+    def _s(y):
+        return _omr_row_support(y, x_centers, obs_xy, tol_y, tol_x)
+
+    s_primera, s_antes_primera = _s(y0), _s(y0 - dy)
+    s_ultima, s_despues_ultima = _s(y0 + (n_filas - 1) * dy), _s(y0 + n_filas * dy)
+    ganancia_subir = s_antes_primera - s_ultima      # correr y0 -= dy: gana fila de arriba, pierde la última
+    ganancia_bajar = s_despues_ultima - s_primera    # correr y0 += dy: gana fila de abajo, pierde la primera
+    UMBRAL_SHIFT = 0.6  # en soporte 0..5 -- una fila real completa aporta ~5
+    if ganancia_subir > UMBRAL_SHIFT and ganancia_subir >= ganancia_bajar:
+        violaciones.append("ROW_INDEX_SHIFT_corregido")
+        y0 -= dy
+    elif ganancia_bajar > UMBRAL_SHIFT:
+        violaciones.append("ROW_INDEX_SHIFT_corregido")
+        y0 += dy
+    elif abs(ganancia_subir) < UMBRAL_SHIFT and s_antes_primera > 0.6:
+        # ni claramente mejor ni claramente peor corrida un puesto -- no se
+        # puede afirmar con confianza cuál de las dos ventanas es la física
+        # real (item 16: el orden y1<y2<... no alcanza como garantía).
+        violaciones.append("ROW_INDEX_SHIFT_ambiguo")
+    elif abs(ganancia_bajar) < UMBRAL_SHIFT and s_despues_ultima > 0.6:
+        violaciones.append("ROW_INDEX_SHIFT_ambiguo")
+
+    y_pred = y0 + np.arange(n_filas) * dy
+
+    # Microajuste local acotado (±0.28*dy, ver item 12) + regularización por
+    # suavidad vía programación dinámica (item 13): un salto grande en un
+    # delta aislado solo se acepta si el soporte visual lo justifica lo
+    # bastante como para pagar la penalización de discontinuidad.
+    K = 13
+    deltas_cand = np.linspace(-0.28 * dy, 0.28 * dy, K)
+    soporte_grid = np.empty((n_filas, K))
+    for i in range(n_filas):
+        for k, d in enumerate(deltas_cand):
+            soporte_grid[i, k] = _omr_row_support(y_pred[i] + d, x_centers, obs_xy, tol_y, tol_x)
+    # Penalización mínima hacia delta=0 (además de la suavidad entre filas
+    # vecinas de más abajo): sin esto, cuando la tolerancia de soporte es más
+    # ancha que el rango de microajuste (tolerancia real de una foto borrosa,
+    # o el caso límite sin ruido de estos tests sintéticos), TODOS los
+    # candidatos de delta dan exactamente el mismo soporte para una fila --
+    # un empate real que np.argmin rompe siempre hacia el primer índice
+    # (el extremo -0.28*dy), produciendo un sesgo sistemático de toda la
+    # banda hacia un mismo lado en vez de quedarse en delta=0 por falta de
+    # evidencia que justifique moverse. La magnitud es deliberadamente chica
+    # (a lo sumo ~0.04 en unidades de soporte 0..5) para que solo desempate,
+    # nunca para que pese más que una diferencia real de soporte (perder o
+    # ganar una sola columna ya vale 1.0).
+    costo = -soporte_grid + 0.5 * (deltas_cand[None, :] / dy) ** 2
+    lam = 3.0
+    dp = np.empty((n_filas, K))
+    back = np.zeros((n_filas, K), dtype=int)
+    dp[0] = costo[0]
+    penal_base = (deltas_cand[:, None] - deltas_cand[None, :]) ** 2 / (dy ** 2)
+    for i in range(1, n_filas):
+        total = dp[i - 1][None, :] + lam * penal_base
+        back[i] = np.argmin(total, axis=1)
+        dp[i] = costo[i] + total[np.arange(K), back[i]]
+    idxs = np.zeros(n_filas, dtype=int)
+    idxs[-1] = int(np.argmin(dp[-1]))
+    for i in range(n_filas - 1, 0, -1):
+        idxs[i - 1] = back[i, idxs[i]]
+    row_offsets = deltas_cand[idxs]
+    row_support = soporte_grid[np.arange(n_filas), idxs] / 5.0
+
+    y_centers = y_pred + row_offsets
+    # Límite físico duro: ninguna fila puede muestrearse fuera de la banda
+    # (no existe tinta ahí). El anclaje de y0 ya deja margen para el
+    # microajuste (±0.28*dy), pero un delta grande en la fila extrema todavía
+    # puede empujarla un poco más allá del borde -- un clip final, no el
+    # mecanismo primario, asegura que _omr_validar_invariantes_banda nunca
+    # dispare "centro_fuera_de_banda" por este motivo.
+    y_centers = np.clip(y_centers, 0.0, bh)
+
+    # Dos niveles de soporte, no uno solo: una foto real de celular rara vez
+    # deja que Hough encuentre las 5 burbujas A-E de la mayoría de las filas
+    # (fotos reales de este smoke set rondan 10-20 círculos detectados de los
+    # ~100 esperados por banda, aunque la geometría de fondo sea correcta) --
+    # exigir "3 de 5 columnas" en al menos la mitad de las filas como piso de
+    # confianza (como se probó primero) deja la confianza en 0 en CASI TODA
+    # foto real, incluso cuando el ajuste es geométricamente consistente,
+    # perdiendo por completo la utilidad del motor en fotos difíciles (la
+    # app pasaba de "proponer con confianza media para revisar" a "no
+    # proponer nada"). row_coverage_debil (al menos 1 columna real cerca de
+    # la fila predicha) es la señal principal de densidad -- confirma que
+    # ahí existe tinta real de esa fila, no que las 5 alternativas se vean.
+    # row_coverage_fuerte (3+ columnas) sigue existiendo para distinguir el
+    # nivel de evidencia en row_source, no como piso de confianza.
+    row_coverage_debil = float(np.mean(row_support > 0))
+    row_coverage_fuerte = float(np.mean(row_support >= 0.6))
+    mean_abs_delta_norm = float(np.mean(np.abs(row_offsets)) / dy)
+    if dy_prior and dy_prior > 0:
+        dy_consistency = max(0.0, 1.0 - (abs(dy - dy_prior) / dy_prior) / 0.20)
+    else:
+        dy_consistency = 1.0 if not evidencia_debil else 0.5
+
+    # row_alignment_confidence se combina MULTIPLICANDO con otros tres
+    # factores ya existentes de geometry_confidence (ancho entre bandas,
+    # invariantes duros, fuente de columnas) -- point recibido de un smoke
+    # test con fotos reales: si este factor se arma "de a poco" (sumando
+    # evidencia positiva hasta llegar a 1.0, como una primera version de
+    # este calculo), CUALQUIER banda con evidencia sparse (la norma en una
+    # foto real de celular, no la excepcion) queda con row_alignment_confidence
+    # ~0.5-0.6 aun sin ninguna señal de mala alineación, y compuesto con los
+    # otros tres factores (que ya rondan ~0.6-0.7 en fotos dificiles) el
+    # producto final caía sistemáticamente por debajo del piso de
+    # GEOMETRY_ERROR -- pasando de "revisar con una propuesta media" a "sin
+    # propuesta alguna" en la enorme mayoría de fotos reales, no solo en las
+    # que de verdad tienen un problema de alineación. Por eso el diseño es
+    # "inocente hasta que se demuestre lo contrario": cada factor arranca
+    # cerca de 1.0 y solo baja ante evidencia REAL de un problema (poca
+    # densidad extrema, microajustes grandes, dy que no calza con las bandas
+    # hermanas, o un shift de fila ambiguo) -- no por el mero hecho de que la
+    # evidencia sea escasa pero consistente.
+    f_densidad = 0.5 + 0.5 * min(1.0, row_coverage_debil / 0.5)
+    f_suavidad = max(0.5, 1.0 - (mean_abs_delta_norm / 0.30) * 0.5)
+    f_fuerte = 0.9 + 0.1 * row_coverage_fuerte
+    row_alignment_confidence = f_densidad * f_suavidad * dy_consistency * f_fuerte
+    if "ROW_INDEX_SHIFT_ambiguo" in violaciones:
+        row_alignment_confidence *= 0.5
+    if row_coverage_debil < 0.15:
+        # Fail-closed (item 17), pero calibrado a evidencia real: si CASI
+        # NINGUNA fila tiene siquiera una burbuja real cerca (banda
+        # efectivamente vacía de evidencia, no solo escasa), no hay base
+        # para afirmar que la grilla está alineada aunque período/origen
+        # "parezcan" razonables.
+        row_alignment_confidence = 0.0
+    row_alignment_confidence = float(np.clip(row_alignment_confidence, 0.0, 1.0))
+    row_coverage = row_coverage_debil  # nombre expuesto en diagnostico/tests
+
+    # row_source describe qué tan demostrado quedó el resultado FINAL --
+    # ROBUST_LATTICE exige evidencia densa de verdad (3+ columnas en la
+    # mayoría de las filas), LATTICE_INTERPOLATED cubre el caso típico de
+    # foto real (evidencia dispersa pero real y geométricamente consistente).
+    if row_coverage_fuerte >= 0.7 and n_clusters >= max(6, n_filas * 0.4) and not evidencia_debil:
+        row_source = "ROBUST_LATTICE"
+    elif row_coverage_debil >= 0.15 or n_clusters >= 3:
+        row_source = "LATTICE_INTERPOLATED"
+    else:
+        row_source = "UNIFORM_FALLBACK"
+
+    return {
+        "y_centers": y_centers, "y0": float(y0), "dy": float(dy),
+        "row_support": row_support, "row_offsets": row_offsets,
+        "row_alignment_confidence": row_alignment_confidence, "row_source": row_source,
+        "diagnostico": {"violaciones": violaciones, "n_clusters": n_clusters,
+                         "row_coverage": row_coverage, "mean_abs_delta_norm": mean_abs_delta_norm},
+    }
+# ───────────────────────── fin ROW LATTICE (v4.1) ─────────────────────────
+
+
+# ───────────────────── NUMBER LATTICE (v4.1) ──────────────────────────────
+# Segundo sensor geométrico INDEPENDIENTE de las burbujas: la plantilla
+# imprime el número de cada fila (1..20 por banda) a la izquierda de la
+# columna A. Sin OCR -- no importa qué dígito es, solo que hay tinta impresa
+# ahí, igual que _omr_encontrar_barra_encabezado ya usa presencia de tinta
+# (no lectura de texto) para ubicar la barra "RESPUESTAS". La franja de
+# números tiene su propia periodicidad y0/dy, estimada con las MISMAS
+# funciones robustas que el lattice de burbujas (reutilizadas, no
+# reimplementadas) -- si ambos sensores coinciden, sube la confianza de que
+# la correspondencia pregunta<->fila física es correcta; si discrepan en
+# 0.5 filas o más, es evidencia fuerte de un ROW_INDEX_SHIFT que ninguno de
+# los dos sensores por separado garantizaba poder detectar.
+def _omr_franja_numeros(band_gray, x0_banda, xA, radio):
+    """Sub-imagen de la franja vertical entre el borde izquierdo de la banda
+    y la columna A (donde va impreso el número de fila), con un margen para
+    no invadir la burbuja A misma."""
+    x_fin = int(round(xA - radio * 1.5))
+    x_ini = int(round(x0_banda))
+    if x_fin - x_ini < 3:
+        return None
+    return band_gray[:, max(0, x_ini):max(x_ini + 3, x_fin)]
+
+
+def _omr_detectar_number_y_obs(franja_gray):
+    """Proyección vertical de tinta dentro de la franja de números: cada
+    grupo contiguo de filas con oscuridad por encima del umbral es un
+    candidato a "aquí hay un número impreso" -- mismo principio que
+    _omr_encontrar_barra_encabezado (presencia de tinta, nunca lectura de
+    texto), aplicado a muchos grupos chicos en vez de una sola barra."""
+    if franja_gray is None or franja_gray.size == 0:
+        return np.empty((0,))
+    row_mean = franja_gray.mean(axis=1).astype(np.float64)
+    umbral = row_mean.mean() - row_mean.std() * 0.4
+    dark = row_mean < umbral
+    obs = []
+    in_run, start = False, 0
+    h = len(dark)
+    for y in range(h):
+        if dark[y] and not in_run:
+            in_run, start = True, y
+        elif not dark[y] and in_run:
+            in_run = False
+            # Un run que TOCA el borde superior/inferior de la franja no
+            # puede confirmarse como un número real -- puede ser el borde de
+            # la banda o de la tabla filtrándose en el recorte (encontrado
+            # en smoke test: un run "0..2" pegado al borde superior producía
+            # una fase de origen falsa a pesar de que el resto de la franja
+            # tenía evidencia limpia y regular). Un número real impreso deja
+            # margen de papel en blanco antes/después, igual que la barra de
+            # encabezado real (_omr_encontrar_barra_encabezado).
+            if start > 0 and y - 1 < h - 1:
+                obs.append((start + y - 1) / 2.0)
+    return np.array(obs, dtype=np.float64)
+
+
+def omr_ajustar_number_lattice(band_gray, x0_banda, xA, radio, bh, n_filas, dy_prior=None, min_obs=4):
+    """Ajusta un lattice y0/dy independiente sobre la franja de números de
+    fila (reutilizando _omr_estimar_dy_robusto/_omr_estimar_y0_robusto, ya
+    genéricas sobre un array 1D de observaciones Y). Devuelve None en
+    'y_centers' cuando la franja no tiene evidencia suficiente -- eso NO es
+    un fallo del lattice de burbujas, simplemente este segundo sensor no
+    pudo aportar nada acá (item 26: number strip borroso no debe penalizar
+    injustificadamente)."""
+    franja = _omr_franja_numeros(band_gray, x0_banda, xA, radio)
+    obs_y = _omr_detectar_number_y_obs(franja) if franja is not None else np.empty((0,))
+    dy_esperado = bh / n_filas
+    if len(obs_y) < min_obs:
+        return {"y_centers": None, "dy": dy_esperado, "y0": None,
+                "number_alignment_confidence": 0.0, "n_obs": int(len(obs_y))}
+
+    y_sorted = np.sort(obs_y)
+    dy_local, n_clusters, _diag = _omr_estimar_dy_robusto(y_sorted, bh, n_filas, dy_esperado)
+    dy = dy_local
+    evidencia_debil = n_clusters < max(4, n_filas * 0.3)
+    if dy_prior and dy_prior > 0 and (evidencia_debil or abs(dy_local - dy_prior) / dy_prior > 0.12):
+        dy = dy_prior
+
+    gap_min = max(2.0, 0.45 * dy)
+    clusters = _omr_cluster_1d_ordenado(y_sorted, gap_min)
+    cluster_centers = np.array([c for c, _n in clusters])
+    if len(cluster_centers) < min_obs:
+        return {"y_centers": None, "dy": dy, "y0": None,
+                "number_alignment_confidence": 0.0, "n_obs": int(len(obs_y))}
+    y0 = _omr_estimar_y0_robusto(cluster_centers, dy, bh, n_filas)
+    y_centers = np.clip(y0 + np.arange(n_filas) * dy, 0.0, bh)
+
+    tol = max(2.0, 0.4 * dy)
+    hits = sum(1 for yc in y_centers if np.any(np.abs(cluster_centers - yc) <= tol))
+    number_alignment_confidence = hits / n_filas
+    return {"y_centers": y_centers, "dy": float(dy), "y0": float(y0),
+            "number_alignment_confidence": float(number_alignment_confidence), "n_obs": int(len(obs_y))}
+
+
+def omr_crosscheck_bubble_number(bubble_y_centers, number_lat, dy):
+    """Compara el lattice de burbujas contra el de números de fila (item 10
+    del plan): row_crosscheck_error[i] = abs(bubble_y[i]-number_y[i])/dy.
+    Solo se considera evidencia real si el number lattice tiene su propia
+    confianza mínima -- un number strip ilegible (confidence baja) no debe
+    poder tirar abajo una geometría de burbujas por lo demás sana."""
+    if number_lat.get("y_centers") is None or number_lat.get("number_alignment_confidence", 0) < 0.3:
+        return {"row_crosscheck_error": None, "shift_confirmado": False}
+    errores = np.abs(np.asarray(bubble_y_centers) - number_lat["y_centers"]) / dy
+    mean_err = float(np.mean(errores))
+    return {"row_crosscheck_error": mean_err, "shift_confirmado": mean_err >= 0.5,
+            "por_fila": errores}
+# ─────────────────────── fin NUMBER LATTICE (v4.1) ────────────────────────
+
+
 def _omr_validar_invariantes_banda(y_centers, x_centers, radio, bh, bw, n_filas):
     """
     Invariantes geométricos duros sobre la grilla YA ajustada de una banda --
@@ -508,10 +993,16 @@ def _omr_validar_invariantes_banda(y_centers, x_centers, radio, bh, bw, n_filas)
 
 
 def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE, bandas_fabricadas=False):
-    """Ajusta, PARA CADA BANDA POR SEPARADO, sus 20 centros de fila y sus 5 centros
-    de columna, usando detección de círculos (Hough) + kmeans 1D. Si Hough no
-    encuentra suficientes círculos en una banda puntual, esa banda cae a una
-    grilla uniforme por proporciones -- las demás siguen con su ajuste por círculos.
+    """Ajusta, PARA CADA BANDA POR SEPARADO, sus 5 centros de columna (kmeans 1D,
+    sin cambios) y sus n_filas centros de fila -- estos últimos vía un ROW LATTICE
+    (v4.1, ver `omr_ajustar_lattice_vertical`): y(i) = y0 + i*dy + delta_i, con
+    y0/dy estimados de forma robusta a partir de los círculos Hough de la banda
+    (nunca 20 posiciones independientes vía kmeans -- esa arquitectura no sabe que
+    las filas impresas son una estructura periódica y puede acumular drift vertical
+    dentro de una banda). Las 4 bandas comparten un `dy_global` (mediana entre las
+    bandas con evidencia fuerte) que regulariza el dy propio de cada banda -- una
+    banda borrosa se apoya en el período demostrado por sus hermanas en vez de caer
+    directo a una grilla uniforme sin relación con la foto real.
 
     También devuelve, por banda, una geometry_confidence en [0, 1] con dos señales
     independientes:
@@ -574,45 +1065,100 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE, bandas_
     # círculos reales, aunque pase las demás señales.
     MULT_POR_FUENTE = {"HOUGH": 1.0, "UNIFORM_FALLBACK": 0.7, "GEOMETRIC_BAND_FALLBACK": 0.45}
 
-    y_centers_por_banda, band_x_centers, radios = [], [], []
-    geometry_confidence, geometry_violaciones, geometry_source = [], [], []
+    # --- Pasada 1: por banda, columnas (x, sin cambios) + dy local propio ---
+    banda_info = []
     for (x0, x1) in bands:
         sel = pts[(pts[:, 0] >= x0) & (pts[:, 0] < x1)]
         ancho_conf = min(x1 - x0, ancho_mediano) / max(x1 - x0, ancho_mediano, 1e-6)
         banda_vacia = len(sel) < max(3, esperados * 0.03)  # casi ningún círculo real -> no hay grilla ahí
         hough_ok = len(sel) >= max(5 * n_filas * 0.35, 10)
         if hough_ok:
-            y_c = _omr_kmeans_1d(sel[:, 1], n_filas)
             x_c = _omr_kmeans_1d(sel[:, 0], 5)
             r_banda = float(np.median(sel[:, 2]))
         else:
-            y_c = _omr_y_centers_uniforme(bh, n_filas)
             bw_band = x1 - x0
             num_w = bw_band * 0.18
             x_c = x0 + num_w + (np.arange(5) + 0.5) * ((bw_band - num_w) / 5)
             r_banda = max(3.0, min_band_w * 0.08)
+        dy_local, n_clusters = None, 0
+        if len(sel) >= 3:
+            dy_local, n_clusters, _diag = _omr_estimar_dy_robusto(np.sort(sel[:, 1]), bh, n_filas, bh / n_filas)
+        banda_info.append({"x0": x0, "sel": sel, "ancho_conf": ancho_conf, "banda_vacia": banda_vacia,
+                            "hough_ok": hough_ok, "x_c": x_c, "r_banda": r_banda,
+                            "dy_local": dy_local, "n_clusters": n_clusters})
+
+    # dy_global (item 15): las 4 bandas comparten el mismo layout impreso, así
+    # que su período vertical debería ser muy parecido -- mediana entre las
+    # bandas con evidencia fuerte (hough_ok), para que una banda borrosa se
+    # apoye en sus hermanas en vez de caer directo a una grilla sin relación
+    # con la foto real.
+    dy_locales_fuertes = [b["dy_local"] for b in banda_info if b["hough_ok"] and b["dy_local"] is not None]
+    dy_global = float(np.median(dy_locales_fuertes)) if dy_locales_fuertes else None
+
+    # --- Pasada 2: fila (y) final vía row lattice robusto, con dy_global como prior ---
+    y_centers_por_banda, band_x_centers, radios = [], [], []
+    geometry_confidence, geometry_violaciones, geometry_source = [], [], []
+    row_alignment_confidence_por_banda, row_source_por_banda = [], []
+    for info in banda_info:
+        sel, x_c, r_banda = info["sel"], info["x_c"], info["r_banda"]
+        obs_xy = sel[:, :2] if len(sel) else np.empty((0, 2))
+        lattice = omr_ajustar_lattice_vertical(obs_xy, x_c, bh, n_filas, r_banda, dy_prior=dy_global)
+        y_c = lattice["y_centers"]
+
         y_centers_por_banda.append(y_c)
         band_x_centers.append(x_c)
         radios.append(r_banda)
 
         if bandas_fabricadas:
             fuente = "GEOMETRIC_BAND_FALLBACK"
-        elif hough_ok:
+        elif info["hough_ok"]:
             fuente = "HOUGH"
         else:
             fuente = "UNIFORM_FALLBACK"
         geometry_source.append(fuente)
+        row_source_por_banda.append(lattice["row_source"])
+        row_alignment_confidence_por_banda.append(round(lattice["row_alignment_confidence"], 3))
 
         mult_inv, violaciones = _omr_validar_invariantes_banda(y_c, x_c, r_banda, bh, bw, n_filas)
-        if banda_vacia:
+        if info["banda_vacia"]:
             violaciones = ["banda_sin_evidencia_circulos"] + violaciones
+        violaciones = violaciones + lattice["diagnostico"].get("violaciones", [])
         mult_fuente = MULT_POR_FUENTE[fuente]
-        geometry_confidence.append(0.0 if banda_vacia else ancho_conf * mult_inv * mult_fuente)
+
+        # NUMBER LATTICE (segundo sensor, item 10-11 del plan): solo actúa
+        # como VETO cuando confirma con evidencia propia razonable un
+        # desacuerdo grande (>=0.5 filas) contra el lattice de burbujas --
+        # nunca como bonus (evitar otro factor multiplicativo que erosione
+        # la confianza de bandas por lo demás sanas, la misma lección del
+        # ajuste anterior a row_alignment_confidence) y nunca si el propio
+        # number lattice no tiene evidencia suficiente (number strip
+        # borroso/ilegible no penaliza injustificadamente).
+        mult_crosscheck = 1.0
+        number_lat = omr_ajustar_number_lattice(body_gray, info["x0"], x_c[0], r_banda, bh, n_filas,
+                                                  dy_prior=dy_global)
+        crosscheck = omr_crosscheck_bubble_number(y_c, number_lat, lattice["dy"])
+        if crosscheck["shift_confirmado"]:
+            # Diagnóstico siempre visible (útil para smoke test / futura
+            # habilitación), pero el veto sobre geometry_confidence respeta
+            # el feature flag -- ver NUMBER_LATTICE_CROSSCHECK_HABILITADO.
+            violaciones.append("BUBBLE_NUMBER_DISAGREEMENT" if NUMBER_LATTICE_CROSSCHECK_HABILITADO
+                                else "BUBBLE_NUMBER_DISAGREEMENT_ignorado_flag_off")
+            if NUMBER_LATTICE_CROSSCHECK_HABILITADO:
+                mult_crosscheck = 0.25
+
+        # row_alignment_confidence entra como un quinto factor multiplicativo
+        # fail-closed (item 17): ninguna banda puede llegar a GEOMETRY_OK si
+        # su alineación vertical no está demostrada, aunque las otras tres
+        # señales (ancho, invariantes, fuente de columnas) estén perfectas.
+        geo_conf = (0.0 if info["banda_vacia"] else
+                    info["ancho_conf"] * mult_inv * mult_fuente * lattice["row_alignment_confidence"] * mult_crosscheck)
+        geometry_confidence.append(geo_conf)
         geometry_violaciones.append(violaciones)
 
     radio = float(np.median(radios))
     return (np.array(y_centers_por_banda), np.array(band_x_centers), radio,
-            geometry_confidence, geometry_violaciones, geometry_source)
+            geometry_confidence, geometry_violaciones, geometry_source,
+            row_alignment_confidence_por_banda, row_source_por_banda)
 
 
 def _omr_oscuridad_celda(gray, cx, cy, r, r_inner_frac=0.6):
@@ -844,7 +1390,8 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
         gray_det, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
         permitir_reparto_geometrico=not es_recorte)
     body_gray_det = gray_det[header_bottom_det:, :]
-    y_centers_det, band_x_centers_det, radio_det, geometry_confidence, geometry_violaciones, geometry_source = (
+    (y_centers_det, band_x_centers_det, radio_det, geometry_confidence, geometry_violaciones, geometry_source,
+     row_alignment_confidence_por_banda, row_source_por_banda) = (
         omr_ajustar_grilla(body_gray_det, bands_det, bandas_fabricadas=bandas_fabricadas))
 
     # Escalar toda la geometría encontrada de vuelta a la resolución original
@@ -884,6 +1431,8 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
             r["geometry_state"] = geo_estado
             r["geometry_violaciones"] = geometry_violaciones[bi]
             r["geometry_source"] = geometry_source[bi]
+            r["row_alignment_confidence"] = row_alignment_confidence_por_banda[bi]
+            r["row_source"] = row_source_por_banda[bi]
             if geo_estado == "GEOMETRY_ERROR":
                 # Sin evidencia real (círculos Hough + invariantes de grilla) de
                 # que esta banda sea una grilla de burbujas -- pudo caer sobre
@@ -905,6 +1454,8 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
         "geometry_confidence_por_banda": [round(g, 3) for g in geometry_confidence],
         "geometry_violaciones_por_banda": geometry_violaciones,
         "geometry_source_por_banda": geometry_source,
+        "row_alignment_confidence_por_banda": row_alignment_confidence_por_banda,
+        "row_source_por_banda": row_source_por_banda,
         "resultados": resultados,
     }
 
@@ -918,7 +1469,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "4.0.0"
+VERSION_APP = "4.0.1"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 # Motor OMR v4: geometry_confidence + geometry_state (OK/WARNING/ERROR) +
@@ -928,7 +1479,21 @@ DESARROLLADO_POR = "Matías Rifo V."
 # candidato espurio más ancho), y arbitraje de IA para respuestas ambiguas
 # apagado por defecto. Validado contra fixtures + smoke test con fotos
 # reales adicionales (privado, fuera del repo) antes de fusionar a main.
-OMR_ENGINE_VERSION = "4.0.0"
+#
+# v4.1 (ROW LATTICE): reemplaza los 20 centros de fila por banda -- antes
+# kmeans 1D independiente, sin noción de que las filas impresas son una
+# estructura periódica, causa raíz del drift vertical acumulado dentro de
+# una banda -- por una grilla regular y(i)=y0+i*dy+delta_i con y0/dy
+# estimados de forma robusta (fase circular + anclaje al margen de
+# plantilla, dy compartido entre bandas hermanas) y microajuste local
+# acotado (±0.28*dy) y suavizado (programación dinámica). row_alignment_confidence
+# entra como quinto factor fail-closed de geometry_confidence. Segundo
+# sensor independiente (NUMBER LATTICE, sobre los números de fila impresos)
+# implementado y con tests, pero su veto sobre geometry_confidence queda
+# OFF por defecto (NUMBER_LATTICE_CROSSCHECK_HABILITADO=False) tras medir un
+# falso positivo en la foto de calibración real -- no se habilita un gate
+# adicional sin evidencia de que no introduce más riesgo del que evita.
+OMR_ENGINE_VERSION = "4.1.0"
 
 st.markdown("""
 <style>
@@ -1653,6 +2218,8 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
             "geometry_confidence_por_banda": salida.get("geometry_confidence_por_banda", []),
             "geometry_violaciones_por_banda": salida.get("geometry_violaciones_por_banda", []),
             "geometry_source_por_banda": salida.get("geometry_source_por_banda", []),
+            "row_alignment_confidence_por_banda": salida.get("row_alignment_confidence_por_banda", []),
+            "row_source_por_banda": salida.get("row_source_por_banda", []),
             "n_geometry_error": sum(1 for m in metodo_por_pregunta if m == "revisar_geometria"),
             "n_geometry_warning": sum(1 for r in resultados if r.get("geometry_state") == "GEOMETRY_WARNING"),
             "n_answers_omr": n_answers_omr,
