@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "1.6.0"
+VERSION_APP = "1.7.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -66,6 +66,7 @@ for k, v in {
     "pauta": [],
     "fotos_pendientes": {},  # {id_unico: {nombre, bytes, mime, hash}} — subidas sin procesar aún
     "pauta_df": df_pauta_vacio(80),
+    "modo_captura": "completa",  # "completa" | "solo_respuestas"
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -73,7 +74,7 @@ for k, v in {
 OPCIONES = ["A", "B", "C", "D", "E", "—"]
 
 
-def prompt_dinamico(n: int, num_imagenes: int = 1) -> str:
+def prompt_dinamico(n: int, num_imagenes: int = 1, solo_respuestas: bool = False) -> str:
     num_columnas = -(-n // 20)  # división hacia arriba: esta plantilla usa columnas de 20 preguntas
     rangos = []
     for c in range(num_columnas):
@@ -82,7 +83,23 @@ def prompt_dinamico(n: int, num_imagenes: int = 1) -> str:
         rangos.append(f"columna {c+1} = preguntas {ini} a {fin}")
     descripcion_columnas = "; ".join(rangos)
 
-    if num_imagenes >= 3:
+    if solo_respuestas and num_imagenes >= 2:
+        nota_imagenes = """IMPORTANTE — te adjunto 2 fotos que son acercamientos en zoom de la MISMA hoja, ya
+recortada de antemano para mostrar ÚNICAMENTE el bloque RESPUESTAS (sin cabecera ni datos del estudiante):
+1. Acercamiento de la MITAD IZQUIERDA del bloque RESPUESTAS.
+2. Acercamiento de la MITAD DERECHA del bloque RESPUESTAS (con algo de superposición con la anterior).
+
+No hay ninguna otra imagen de referencia: estas 2 fotos son todo lo que tienes de esta hoja. No busques ni
+inventes nombre, cédula o folleto — no aparecen en estas fotos y tampoco se piden en la respuesta.
+
+"""
+    elif solo_respuestas:
+        nota_imagenes = """IMPORTANTE — la foto adjunta ya viene recortada de antemano para mostrar ÚNICAMENTE
+el bloque RESPUESTAS (sin cabecera ni datos del estudiante). No busques ni inventes nombre, cédula o folleto —
+no aparecen en esta foto y tampoco se piden en la respuesta.
+
+"""
+    elif num_imagenes >= 3:
         nota_imagenes = """IMPORTANTE — te adjunto 3 fotos de la MISMA hoja de respuestas, en este orden:
 1. La hoja completa (úsala para identificar al estudiante: apellidos, nombres, cédula, folleto).
 2. Un acercamiento en zoom de la MITAD IZQUIERDA de esa misma hoja.
@@ -96,7 +113,14 @@ foto completa (imagen 1) es solo de referencia general y para los datos de ident
     else:
         nota_imagenes = ""
 
-    return f"""{nota_imagenes}Eres un experto en leer hojas de respuestas de alternativas (A/B/C/D/E) de estudiantes chilenos.
+    if solo_respuestas:
+        bloque_estructura = f"""Estás viendo SOLO el bloque "RESPUESTAS" de una hoja de respuestas de alternativas
+(A/B/C/D/E) de estudiantes chilenos, recortado de la plantilla fija "PLANTILLA DE HOJA DE RESPUESTAS". Esa
+plantilla organiza siempre las respuestas en columnas de 20 preguntas cada una, puestas una al lado de la otra
+de izquierda a derecha: {descripcion_columnas}. Dentro de cada columna, cada fila tiene el número de pregunta
+impreso a la izquierda seguido de 5 burbujas A-E."""
+    else:
+        bloque_estructura = f"""Eres un experto en leer hojas de respuestas de alternativas (A/B/C/D/E) de estudiantes chilenos.
 Todas las hojas que vas a revisar usan siempre la misma plantilla fija "PLANTILLA DE HOJA DE RESPUESTAS", con
 esta estructura exacta:
 
@@ -110,7 +134,36 @@ esta estructura exacta:
   vienen vacíos; si no hay nada escrito ahí, deja "nro_folleto" como cadena vacía.
 - El bloque grande "RESPUESTAS" está dividido en columnas de 20 preguntas cada una, puestas una al lado de la
   otra de izquierda a derecha: {descripcion_columnas}. Dentro de cada columna, cada fila tiene el número de
-  pregunta impreso a la izquierda seguido de 5 burbujas A-E.
+  pregunta impreso a la izquierda seguido de 5 burbujas A-E."""
+
+    if solo_respuestas:
+        schema = """{
+  "respuestas": ["A","B",...],
+  "dudosas": [3, 15]
+}"""
+        reglas_formato = f"""Reglas de formato:
+- "respuestas": exactamente {n} elementos, en el mismo orden P1..P{n}. Usa null solo si la pregunta está
+  realmente omitida (ninguna marca visible), no como comodín para lo que no estés seguro.
+- "dudosas": números de pregunta (1 a {n}) con riesgo real de error, según el criterio simple de arriba.
+- Solo el JSON, sin explicación ni comentarios adicionales."""
+    else:
+        schema = """{
+  "apellido_paterno": "...",
+  "apellido_materno": "...",
+  "nombres": "...",
+  "cedula": "...",
+  "nro_folleto": "...",
+  "respuestas": ["A","B",...],
+  "dudosas": [3, 15]
+}"""
+        reglas_formato = f"""Reglas de formato:
+- "respuestas": exactamente {n} elementos, en el mismo orden P1..P{n}. Usa null solo si la pregunta está
+  realmente omitida (ninguna marca visible), no como comodín para lo que no estés seguro.
+- "dudosas": números de pregunta (1 a {n}) con riesgo real de error, según el criterio simple de arriba.
+- Campos de texto ilegibles o no visibles en la hoja: cadena vacía "".
+- Solo el JSON, sin explicación ni comentarios adicionales."""
+
+    return f"""{nota_imagenes}{bloque_estructura}
 
 CÓMO ESTÁ MARCADA ESTA HOJA:
 Cada pregunta tiene 5 círculos impresos que dicen A, B, C, D, E. El estudiante marca su respuesta rellenando o
@@ -147,22 +200,9 @@ ser falsa.
 
 Responde ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown, con esta forma exacta:
 
-{{
-  "apellido_paterno": "...",
-  "apellido_materno": "...",
-  "nombres": "...",
-  "cedula": "...",
-  "nro_folleto": "...",
-  "respuestas": ["A","B",...],
-  "dudosas": [3, 15]
-}}
+{schema}
 
-Reglas de formato:
-- "respuestas": exactamente {n} elementos, en el mismo orden P1..P{n}. Usa null solo si la pregunta está
-  realmente omitida (ninguna marca visible), no como comodín para lo que no estés seguro.
-- "dudosas": números de pregunta (1 a {n}) con riesgo real de error, según el criterio simple de arriba.
-- Campos de texto ilegibles o no visibles en la hoja: cadena vacía "".
-- Solo el JSON, sin explicación ni comentarios adicionales."""
+{reglas_formato}"""
 
 
 # ─── Funciones de datos ──────────────────────────────────────────────
@@ -203,16 +243,16 @@ def mejorar_contraste_burbujas(img: Image.Image) -> Image.Image:
     img_contraste = ImageEnhance.Contrast(img_gris).enhance(1.8)
     return ImageEnhance.Sharpness(img_contraste).enhance(2.0)
 
-def preparar_imagenes(datos_bytes: bytes, mime: str):
+def preparar_imagenes(datos_bytes: bytes, mime: str, solo_respuestas: bool = False):
     """
     Claude redimensiona internamente cualquier imagen a un techo fijo de resolución
     antes de analizarla. Si las 80 preguntas van en una sola foto, ese techo se
     reparte entre las 80 y cada burbuja queda en unos pocos píxeles — insuficiente
-    para distinguir con fiabilidad el rayado a lápiz. Por eso se generan 3 versiones
-    de la misma foto: completa (para identificación del alumno) y dos acercamientos
-    —mitad izquierda / mitad derecha, recortando además el 10% superior donde no hay
-    burbujas— que le dan a cada mitad del bloque RESPUESTAS su propio techo de
-    resolución completo.
+    para distinguir con fiabilidad el rayado a lápiz. Por eso se generan 2-3 versiones
+    de la misma foto: mitad izquierda / mitad derecha del bloque RESPUESTAS (siempre),
+    más la foto completa para identificación del alumno (solo si el modo NO es
+    "solo_respuestas") — cada mitad le da a su franja del bloque RESPUESTAS su propio
+    techo de resolución completo en vez de compartirlo con el resto de la hoja.
     """
     try:
         img = Image.open(io.BytesIO(datos_bytes))
@@ -220,22 +260,37 @@ def preparar_imagenes(datos_bytes: bytes, mime: str):
         # realmente rotadas en los píxeles: sin corregir esto, la imagen puede llegar
         # "acostada" 90°/180° a la API aunque se vea derecha en el celular, lo que
         # desalinea por completo el recorte de cabecera/mitades de más abajo y produce
-        # lecturas erráticas de todo el bloque de respuestas.
+        # lecturas erráticas de todo el bloque de respuestas. Esto NO cubre fotos que
+        # ya vienen genuinamente rotadas en los píxeles (sin metadato EXIF, p.ej. tras
+        # pasar por WhatsApp o un editor que lo eliminó) — para esas, la corrección
+        # tiene que hacerla quien toma/recorta la foto antes de subirla.
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
     except Exception:
         return [(base64.standard_b64encode(datos_bytes).decode(), mime)]
     w, h = img.size
-    completa = _img_a_b64_jpeg(img, 1568, 90)
+    margen = 0.10  # superposición horizontal para no cortar una columna justo por la mitad
+    mitad = w // 2
+    overlap = int(w * margen)
 
+    if solo_respuestas:
+        # La foto ya viene recortada por quien la sube para mostrar solo el bloque
+        # RESPUESTAS: no hay cabecera que saltar (top=0, se aprovecha el 100% del alto)
+        # ni necesidad de una "completa" (la identificación es 100% manual en este modo),
+        # así que todo el presupuesto de resolución de Claude se dedica a las burbujas.
+        izq = mejorar_contraste_burbujas(img.crop((0, 0, min(w, mitad + overlap), h)))
+        der = mejorar_contraste_burbujas(img.crop((max(0, mitad - overlap), 0, w, h)))
+        return [
+            (_img_a_b64_jpeg(izq, 1568, 92), "image/jpeg"),
+            (_img_a_b64_jpeg(der, 1568, 92), "image/jpeg"),
+        ]
+
+    completa = _img_a_b64_jpeg(img, 1568, 90)
     # Recorte vertical conservador: en esta plantilla la identificación del alumno
     # siempre ocupa bastante más del 10% superior de la hoja, así que descartar solo
     # ese 10% en los acercamientos no arriesga cortar filas de RESPUESTAS aunque la
     # foto venga encuadrada de forma distinta cada vez.
     top = int(h * 0.10)
-    margen = 0.10  # superposición horizontal para no cortar una columna justo por la mitad
-    mitad = w // 2
-    overlap = int(w * margen)
     izq = mejorar_contraste_burbujas(img.crop((0, top, min(w, mitad + overlap), h)))
     der = mejorar_contraste_burbujas(img.crop((max(0, mitad - overlap), top, w, h)))
     return [
@@ -272,11 +327,12 @@ def evaluar_sospecha(res: dict) -> None:
         res["sospechoso"] = False
         res["motivo_sospecha"] = ""
 
-def _llamar_claude(cliente, bloques_imagen: list, n: int, num_imagenes: int, texto_extra: str = "") -> dict:
+def _llamar_claude(cliente, bloques_imagen: list, n: int, num_imagenes: int,
+                    solo_respuestas: bool = False, texto_extra: str = "") -> dict:
     msg = cliente.messages.create(
         model="claude-sonnet-5", max_tokens=6144,
         messages=[{"role":"user","content": bloques_imagen + [
-            {"type":"text","text":prompt_dinamico(n, num_imagenes) + texto_extra},
+            {"type":"text","text":prompt_dinamico(n, num_imagenes, solo_respuestas) + texto_extra},
         ]}],
     )
     if msg.stop_reason == "max_tokens":
@@ -302,20 +358,21 @@ REFUERZO_REINTENTO = (
     "REGLA DE ORO fila por fila y verificando el número IMPRESO de cada fila antes de registrar "
     "su respuesta.")
 
-def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
-    imagenes = preparar_imagenes(datos_bytes, mime)
+def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
+                     solo_respuestas: bool = False) -> dict:
+    imagenes = preparar_imagenes(datos_bytes, mime, solo_respuestas)
     bloques_imagen = [
         {"type":"image","source":{"type":"base64","media_type":mt,"data":data}}
         for data, mt in imagenes
     ]
-    res = _llamar_claude(cliente, bloques_imagen, n, len(imagenes))
+    res = _llamar_claude(cliente, bloques_imagen, n, len(imagenes), solo_respuestas)
     evaluar_sospecha(res)
     intentos = 1
     # Un solo reintento automático cuando el primer resultado se ve estadísticamente
     # inverosímil: es barato (una llamada más) frente al costo de que el profesor
     # confíe en un resultado erróneo sin darse cuenta.
     if res["sospechoso"]:
-        res2 = _llamar_claude(cliente, bloques_imagen, n, len(imagenes), REFUERZO_REINTENTO)
+        res2 = _llamar_claude(cliente, bloques_imagen, n, len(imagenes), solo_respuestas, REFUERZO_REINTENTO)
         evaluar_sospecha(res2)
         intentos = 2
         if not res2["sospechoso"]:
@@ -327,6 +384,7 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int)
     res["archivo"] = nombre
     res["n_preguntas"] = n
     res["intentos"] = intentos
+    res["solo_respuestas"] = solo_respuestas
     return res
 
 def datos_efectivos(arch: str) -> dict:
@@ -536,6 +594,30 @@ with st.sidebar:
         st.rerun()
     st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
     st.markdown("---")
+    st.markdown("**Modo de carga de fotos**")
+    opciones_modo = {
+        "completa": "📄 Hoja completa (recorte automático)",
+        "solo_respuestas": "✂️ Solo bloque RESPUESTAS (ya recortado por ti)",
+    }
+    modo_prev = st.session_state["modo_captura"]
+    modo_nuevo = st.radio(
+        "Modo de carga", options=list(opciones_modo.keys()),
+        format_func=lambda k: opciones_modo[k],
+        index=list(opciones_modo.keys()).index(modo_prev),
+        label_visibility="collapsed", disabled=hay_procesadas,
+    )
+    if hay_procesadas:
+        st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modo. Usa **Limpiar todo** antes de cambiarlo.")
+    elif modo_nuevo != modo_prev:
+        st.session_state["modo_captura"] = modo_nuevo
+        st.rerun()
+    if st.session_state["modo_captura"] == "solo_respuestas":
+        st.caption("✂️ Sube la foto recortada para mostrar **solo** el bloque RESPUESTAS (sin cabecera). "
+                   "Nombre, RUT y folleto quedan en blanco — los completas a mano en **Revisar y corregir**. "
+                   "Es el modo más preciso: toda la resolución se dedica a las burbujas.")
+    else:
+        st.caption("📄 Sube la foto de la hoja completa; la app recorta e identifica al alumno automáticamente.")
+    st.markdown("---")
     if st.button("🗑️ Limpiar todo", use_container_width=True):
         nn = st.session_state["n_preguntas"]
         st.session_state.update({
@@ -627,6 +709,8 @@ with tab_cargar:
     except Exception:
         app_url = ""
 
+    modo_actual = st.session_state["modo_captura"]
+
     if app_url:
         cq, ci = st.columns([1,2], gap="large")
         with cq:
@@ -634,7 +718,18 @@ with tab_cargar:
             st.image(generar_qr(app_url), width=180, caption="Escanea para abrir en tu celular")
         with ci:
             st.markdown("### Instrucciones")
-            st.markdown("""
+            if modo_actual == "solo_respuestas":
+                st.markdown("""
+1. Escanea el QR o entra a la URL en el navegador del celular
+2. Toca **Cargar fotos** arriba
+3. Toca **Upload** → elige **Cámara** o **Galería**
+4. **Recorta o encuadra la foto para que muestre SOLO el bloque RESPUESTAS**, sin la
+   cabecera de nombre/RUT — que ocupe todo el encuadre, sin mesa ni fondo alrededor
+5. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
+6. Sube varias antes de procesar; nombre y RUT los completas a mano después
+""")
+            else:
+                st.markdown("""
 1. Escanea el QR o entra a la URL en el navegador del celular
 2. Toca **Cargar fotos** arriba
 3. Toca **Upload** → elige **Cámara** o **Galería**
@@ -653,10 +748,15 @@ with tab_cargar:
     st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
     st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
                "cada una queda guardada aunque la cámara se abra de nuevo.")
-    st.caption("📸 **Clave para que la IA lea bien:** acerca la cámara y llena el encuadre con la hoja "
-               "(sin fondo alrededor), foto derecha y con buena luz. Con 80 preguntas × 5 burbujas en una "
-               "sola foto, cada burbuja es muy pequeña — mientras más cerca y nítida la tomes, mejor detecta "
-               "cuál está marcada.")
+    if modo_actual == "solo_respuestas":
+        st.caption("✂️ **Clave para que la IA lea bien:** la foto debe mostrar ÚNICAMENTE el bloque "
+                   "RESPUESTAS (sin cabecera de nombre/RUT), encuadrada derecha, sin fondo alrededor y con "
+                   "buena luz. Al no compartir resolución con la cabecera, cada burbuja se ve mucho más grande.")
+    else:
+        st.caption("📸 **Clave para que la IA lea bien:** acerca la cámara y llena el encuadre con la hoja "
+                   "(sin fondo alrededor), foto derecha y con buena luz. Con 80 preguntas × 5 burbujas en una "
+                   "sola foto, cada burbuja es muy pequeña — mientras más cerca y nítida la tomes, mejor detecta "
+                   "cuál está marcada.")
     st.caption("💡 Recomendado: procesa de a **15–20 fotos por lote** (no 40–80 de una vez). "
                "Así el progreso no se pierde si el celular se bloquea o hay corte de conexión, "
                "y luego puedes exportar cada lote y unirlos en un Excel maestro.")
@@ -719,7 +819,8 @@ with tab_cargar:
             for i, (id_unico, foto) in enumerate(items):
                 prog.progress(i/len(items), text=f"Procesando {foto['nombre']} ({i+1}/{len(items)})...")
                 try:
-                    res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n)
+                    res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
+                                           solo_respuestas=(modo_actual == "solo_respuestas"))
                     res["hash"] = foto["hash"]
                     st.session_state.resultados[id_unico] = res
                     st.session_state.fotos_pendientes.pop(id_unico, None)
@@ -759,15 +860,23 @@ with tab_revisar:
             if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
         )
         sospechosas = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
-        m1,m2,m3,m4 = st.columns(4)
+        sin_id = sum(
+            1 for a, d in st.session_state.resultados.items()
+            if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
+                     or datos_efectivos(a).get("cedula"))
+        )
+        m1,m2,m3,m4,m5 = st.columns(5)
         m1.metric("Alumnos procesados", total_alumnos)
         m2.metric("Con dudas pendientes", pendientes)
         m3.metric("Preguntas por prueba", n)
-        m4.metric("⚠️ Patrón sospechoso", sospechosas)
+        m4.metric("🚨 Patrón sospechoso", sospechosas)
+        m5.metric("🆔 Sin identificar", sin_id)
         if sospechosas:
             st.error(f"🚨 {sospechosas} hoja(s) con un patrón de respuestas estadísticamente inverosímil "
                      "(revisadas dos veces por la IA y aun así el resultado es raro). Ábrelas más abajo y "
                      "compáralas manualmente con la foto original antes de confiar en su puntaje.")
+        if sin_id:
+            st.warning(f"🆔 {sin_id} hoja(s) sin apellido, nombre ni cédula — complétalas más abajo antes de exportar.")
         st.markdown("---")
 
         for arch, datos_orig in st.session_state.resultados.items():
@@ -786,17 +895,25 @@ with tab_revisar:
             else:
                 puntaje_str = "_(sin pauta)_"
 
-            es_sospechoso = bool(datos_orig.get("sospechoso"))
-            icono = "🚨" if es_sospechoso else ("⚠️" if pend_este else "✅")
+            es_sospechoso  = bool(datos_orig.get("sospechoso"))
+            sin_identificar = not (datos.get("apellido_paterno") or datos.get("nombres") or datos.get("cedula"))
+            icono = "🚨" if es_sospechoso else ("🆔" if sin_identificar else ("⚠️" if pend_este else "✅"))
+            nombre_titulo = (f"{datos.get('apellido_paterno','')} {datos.get('nombres','')} — {datos.get('cedula','')}"
+                              if not sin_identificar
+                              else f"*(sin identificar — {datos_orig.get('archivo', arch)})*")
             with st.expander(
-                f"{icono} {datos.get('apellido_paterno','')} {datos.get('nombres','')} "
-                f"— {datos.get('cedula','')} | {puntaje_str}",
-                expanded=bool(pend_este or es_sospechoso)
+                f"{icono} {nombre_titulo} | {puntaje_str}",
+                expanded=bool(pend_este or es_sospechoso or sin_identificar)
             ):
                 if es_sospechoso:
                     st.error(f"🚨 **Patrón sospechoso:** {datos_orig.get('motivo_sospecha','')}")
+                if sin_identificar:
+                    st.warning("🆔 Falta identificar al alumno — completa al menos apellido paterno o cédula abajo.")
                 # ── Datos editables del alumno ──────────────────────
-                st.markdown("**Datos del alumno** *(edita si Claude leyó mal algún campo)*")
+                if datos_orig.get("solo_respuestas"):
+                    st.markdown("**Datos del alumno** *(modo solo-respuestas: complétalos a mano)*")
+                else:
+                    st.markdown("**Datos del alumno** *(edita si Claude leyó mal algún campo)*")
                 ie = st.session_state.info_edits.get(arch, {})
 
                 r1c1, r1c2, r1c3 = st.columns(3)
@@ -897,7 +1014,12 @@ with tab_exportar:
         )
         total_p=sum(1 for p in pauta if p)
         sospechosas_exp = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
-        m1,m2,m3,m4=st.columns(4)
+        sin_id_exp = sum(
+            1 for a in st.session_state.resultados
+            if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
+                     or datos_efectivos(a).get("cedula"))
+        )
+        m1,m2,m3,m4,m5=st.columns(5)
         m1.metric("Alumnos",len(st.session_state.resultados))
         m2.metric("Preguntas evaluadas",total_p)
         m3.metric("Dudas pendientes",pend_exp,
@@ -906,14 +1028,21 @@ with tab_exportar:
         m4.metric("🚨 Sospechosas",sospechosas_exp,
                   delta="revisar antes" if sospechosas_exp else "ninguna",
                   delta_color="inverse" if sospechosas_exp else "normal")
+        m5.metric("🆔 Sin identificar",sin_id_exp,
+                  delta="completar antes" if sin_id_exp else "todo identificado",
+                  delta_color="inverse" if sin_id_exp else "normal")
 
         if sospechosas_exp:
             st.error(f"🚨 {sospechosas_exp} hoja(s) con patrón de respuestas estadísticamente inverosímil — "
                      "revísalas en **Revisar y corregir** antes de confiar en el Excel. Quedan marcadas en la "
                      "columna 'Alerta calidad' del Resumen igualmente.")
+        if sin_id_exp:
+            st.warning(f"🆔 {sin_id_exp} hoja(s) sin apellido, nombre ni cédula — el Excel las mostrará en blanco "
+                       "en esas columnas. Complétalas en **Revisar y corregir** antes de exportar si necesitas "
+                       "identificar a cada alumno.")
         if pend_exp:
             st.warning(f"⚠️ {pend_exp} alumno(s) con dudas sin corregir — quedarán en amarillo.")
-        elif not sospechosas_exp:
+        elif not sospechosas_exp and not sin_id_exp:
             st.success("✅ Todo revisado. El Excel estará completo.")
 
         nombre_xl=f"resultados_{curso.replace(' ','_') if curso else 'curso'}.xlsx"
