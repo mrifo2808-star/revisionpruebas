@@ -17,7 +17,12 @@ angulos/distancias distintas), todo se deriva de la propia imagen:
   2. si se localizo, enderezarlo con una transformacion de perspectiva a partir
      de sus 4 esquinas;
   3. ubicar la barra de encabezado (si existe) y las bandas de columnas (1 a 4,
-     segun cuanto de la tabla se ve) por proyeccion de tinta;
+     segun cuanto de la tabla se ve) por proyeccion de tinta -- probando varios
+     umbrales de sensibilidad, y si ninguno logra distinguir suficientes huecos
+     reales entre columnas (foto borrosa, poco contraste, muy comprimida),
+     repartiendo el ancho de contenido en partes iguales en vez de fallar (la
+     plantilla tiene columnas de ancho fijo por diseño). Esto nunca reescala ni
+     comprime la imagen: solo cambia dónde se traza el límite de cada columna;
   4. ajustar, PARA CADA BANDA POR SEPARADO, una grilla de 20 filas x 5 columnas
      usando deteccion de circulos (Hough) + kmeans 1D -- robusta a que algunas
      burbujas no tengan ningun circulo detectable; si la foto es muy borrosa o
@@ -152,13 +157,45 @@ def enderezar_region(img_bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
 
 # ─── 2) Barra de encabezado + bandas de columnas ─────────────────────────────
 
-def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4):
+def _bandas_por_gaps(col_smooth: np.ndarray, bw: int, umbral: float):
+    mask = col_smooth > umbral
+    bands = []
+    in_band, start = False, 0
+    for x in range(bw):
+        if mask[x] and not in_band:
+            in_band, start = True, x
+        elif not mask[x] and in_band:
+            in_band = False
+            bands.append((start, x))
+    if in_band:
+        bands.append((start, bw))
+    bands = [b for b in bands if (b[1] - b[0]) > bw * 0.04]
+    return bands, mask
+
+
+def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4, bandas_esperadas: int = None):
     """
     Devuelve (header_bottom, bandas) donde bandas es una lista de (x0,x1) — una
     por cada bloque de 20 preguntas visible en la imagen (1 a 4, segun si la
     imagen es la hoja/bloque completo o un recorte parcial). header_bottom=0 si
     no se detecta una barra de encabezado solida (caso de imagenes ya recortadas
     que empiezan directo en la fila 1).
+
+    La separacion de columnas se basa en encontrar huecos en blanco entre ellas
+    (proyeccion de tinta), pero eso puede fallar en fotos borrosas, con poca luz
+    o muy comprimidas (p.ej. reenviadas por WhatsApp): el hueco entre columnas
+    puede no leerse lo bastante "blanco" como para distinguirse. Por eso:
+      1. se prueban varios umbrales de sensibilidad, del mas estricto al mas
+         permisivo, hasta encontrar `bandas_esperadas` bandas reales;
+      2. si ninguno lo logra, se cae a dividir el ancho total de contenido en
+         `bandas_esperadas` franjas iguales -- la plantilla tiene columnas de
+         ancho fijo por diseño, asi que un reparto proporcional es una base
+         razonable incluso sin poder ver los huecos con claridad. Esto NUNCA
+         implica reescalar ni comprimir la imagen: se sigue trabajando sobre
+         los mismos pixeles originales, solo cambia dónde se traza el límite
+         de cada columna.
+    `bandas_esperadas` normalmente es ceil(n_preguntas/20) -- cuantas columnas
+    de 20 preguntas hacen falta para cubrir la pauta configurada.
     """
     h, w = gray.shape
     row_mean = gray.mean(axis=1)
@@ -182,24 +219,32 @@ def detectar_header_y_bandas(gray: np.ndarray, max_bandas: int = 4):
     col_norm = (col_ink - col_ink.min()) / rng
     k = np.ones(5) / 5
     col_smooth = np.convolve(col_norm, k, mode="same")
-    mask = col_smooth > 0.15
 
-    bands = []
-    in_band, start = False, 0
-    for x in range(bw):
-        if mask[x] and not in_band:
-            in_band, start = True, x
-        elif not mask[x] and in_band:
-            in_band = False
-            bands.append((start, x))
-    if in_band:
-        bands.append((start, bw))
-    bands = [b for b in bands if (b[1] - b[0]) > bw * 0.04]
-    if not bands:
-        raise OMRError("No se detectaron columnas de respuestas en la imagen.")
+    objetivo = bandas_esperadas or max_bandas
+    bands, mask = [], col_smooth > 0.15
+    for umbral in (0.15, 0.10, 0.07, 0.045, 0.03):
+        candidatas, mask_u = _bandas_por_gaps(col_smooth, bw, umbral)
+        if len(candidatas) >= objetivo:
+            bands, mask = candidatas, mask_u
+            break
+        if len(candidatas) > len(bands):
+            bands, mask = candidatas, mask_u  # nos quedamos con el mejor intento aunque no alcance el objetivo
+
     if len(bands) > max_bandas:
         bands = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:max_bandas]
         bands = sorted(bands, key=lambda b: b[0])
+
+    if len(bands) < objetivo:
+        # Ningún umbral encontró suficientes huecos reales entre columnas (foto
+        # borrosa/comprimida/poco contraste): repartir el ancho de contenido en
+        # partes iguales en vez de rendirse. Se usa el rango donde SÍ hay algo
+        # de tinta (no el ancho completo de la imagen) para no incluir márgenes
+        # en blanco de los bordes en el reparto.
+        idx_contenido = np.where(col_smooth > 0.03)[0]
+        x0c, x1c = (int(idx_contenido[0]), int(idx_contenido[-1]) + 1) if len(idx_contenido) else (0, bw)
+        ancho = (x1c - x0c) / objetivo
+        bands = [(int(x0c + i * ancho), int(x0c + (i + 1) * ancho)) for i in range(objetivo)]
+
     return header_bottom, bands
 
 
@@ -407,7 +452,7 @@ def anotar_diagnostico(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers
 
 # ─── 7) Orquestacion de una imagen (hoja completa o recorte) ────────────────
 
-def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4) -> dict:
+def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4, n_preguntas: int = None) -> dict:
     """
     Punto de entrada principal: toma una imagen ya cargada (BGR, resolucion
     original, SIN recomprimir) y devuelve la grilla ajustada + resultados OMR
@@ -419,6 +464,10 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4) 
     es_recorte=True: se asume que la imagen YA es (una porcion de) la tabla
       RESPUESTAS -> no se busca ni se recorta nada, se trabaja directo sobre
       toda la imagen (con o sin barra de encabezado visible).
+    n_preguntas: si se indica, cuantas bandas (columnas de 20) hacen falta para
+      cubrirlo -- permite que detectar_header_y_bandas caiga a un reparto
+      geometrico proporcional cuando la foto no tiene contraste suficiente
+      para distinguir los huecos reales entre columnas, en vez de fallar.
 
     Lanza OMRError si no logra ubicar una grilla legible (la app debe caer al
     flujo 100% IA en ese caso).
@@ -430,8 +479,9 @@ def analizar_imagen(img_bgr: np.ndarray, es_recorte: bool, max_bandas: int = 4) 
             raise OMRError("No se pudo localizar el bloque RESPUESTAS en la hoja completa.")
         img = enderezar_region(img, quad)
 
+    bandas_esperadas = min(max_bandas, -(-n_preguntas // N_FILAS_POR_BLOQUE)) if n_preguntas else None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    header_bottom, bands = detectar_header_y_bandas(gray, max_bandas=max_bandas)
+    header_bottom, bands = detectar_header_y_bandas(gray, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas)
     body_gray = gray[header_bottom:, :]
     body_bgr = img[header_bottom:, :]
 

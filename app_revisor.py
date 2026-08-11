@@ -39,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "2.2.0"
+VERSION_APP = "2.3.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -485,7 +485,7 @@ def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict
     if img_pil is None:
         raise omr.OMRError("La imagen no se pudo decodificar.")
     img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    salida = omr.analizar_imagen(img_bgr, es_recorte=solo_respuestas)
+    salida = omr.analizar_imagen(img_bgr, es_recorte=solo_respuestas, n_preguntas=n)
     resultados = salida["resultados"]
     n_disponibles = len(resultados)
     if n_disponibles < n:
