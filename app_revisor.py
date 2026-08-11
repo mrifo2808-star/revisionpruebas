@@ -132,7 +132,10 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int)
             {"type":"text","text":prompt_dinamico(n)},
         ]}],
     )
-    texto = msg.content[0].text.strip()
+    texto = next((b.text for b in msg.content if b.type == "text"), None)
+    if texto is None:
+        raise ValueError("La respuesta de la IA no incluyó texto (solo bloques de razonamiento u otro tipo).")
+    texto = texto.strip()
     m = re.search(r'\{[\s\S]*\}', texto)
     if m:
         texto = m.group(0)
