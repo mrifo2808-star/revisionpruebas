@@ -159,12 +159,24 @@ def main():
 
 
 def _agregar_a_dataset(dataset_path: str, imagen_path: str, n: int, solo_respuestas: bool, respuestas: list):
+    """
+    ATENCIÓN (privacidad): esto escribe la ruta de `--imagen` TAL CUAL la
+    diste en el JSON del dataset. Si ese dataset vive dentro del repo (p.ej.
+    tests/data/omr/dataset.json, que es público), una ruta local con nombres
+    identificables (p.ej. carpetas por alumno) quedaría commiteada en texto
+    plano. Usa esto SOLO para fixtures ya anonimizadas dentro de
+    tests/data/omr/ -- para fotos reales, apunta `--agregar-a-dataset` a un
+    dataset.json fuera del repo (ver datasets_private/ en .gitignore).
+    """
+    print(f"AVISO: se guardará la ruta '{imagen_path}' tal cual en {dataset_path}. "
+          "Si ese archivo es parte del repo público, no uses una ruta con nombres de "
+          "estudiantes u otra carpeta identificable.")
     casos = json.load(open(dataset_path, encoding="utf-8")) if os.path.exists(dataset_path) else []
     entrada = {
         "imagen": imagen_path.replace("\\", "/"),
         "n_preguntas": n,
         "solo_respuestas": solo_respuestas,
-        "respuestas_correctas": respuestas,
+        "respuestas_correctas": respuestas,  # ver NOTA en el docstring del módulo: no es la pauta académica
     }
     casos = [c for c in casos if c.get("imagen") != entrada["imagen"]] + [entrada]
     json.dump(casos, open(dataset_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)

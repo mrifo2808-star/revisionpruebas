@@ -1,2 +1,14 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Datos privados de estudiantes -- fotos reales, ground truth etiquetado a
+# mano, y cualquier secreto local. El repo es público: tests/data/omr/ debe
+# contener SOLO fixtures ya recortadas/anonimizadas (sin nombre/RUT/foto de
+# identificación), nunca el dataset real completo de una aplicación.
+datasets_private/
+tests/data/private/
+ground_truth_private/
+.streamlit/secrets.toml
+.env
+.env.*

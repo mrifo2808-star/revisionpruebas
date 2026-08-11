@@ -1,9 +1,23 @@
 """
-Harness de métricas para comparar 3 métodos de lectura de hojas de respuestas:
-  A) "ia"      — flujo 100% Claude Vision, Claude lee las burbujas (app_revisor.procesar_imagen)
-  B) "omr"     — motor OMR puro, sin ninguna llamada a la API (omr_analizar_imagen)
-  C) "hibrido" — respuestas 100% del motor OMR; Claude solo transcribe nombre/RUT de la
-                 cabecera (nunca lee burbujas) (app_revisor.procesar_imagen_hibrido)
+Harness de métricas para comparar 3 métodos de lectura de hojas de respuestas.
+Terminología exacta (no intercambiable -- ver item 6 del cierre de esta rama):
+
+  A) "ia"      — flujo 100% Claude Vision: Claude LEE las burbujas directamente,
+                 sin ningún paso de visión clásica (app_revisor.procesar_imagen).
+  B) "omr"     — motor OMR puro: SOLO Computer Vision (OpenCV/Hough/kmeans),
+                 cero llamadas a la API, cero intervención de Claude en nada,
+                 ni siquiera identificación (omr_analizar_imagen).
+  C) "hibrido" — OMR es la fuente PRIMARIA de A-E, siempre. Claude interviene
+                 en dos frentes acotados y nunca reemplaza una respuesta que
+                 el OMR ya dio como confiable:
+                   1. identificación (nombre/RUT/folleto) -- siempre disponible;
+                   2. arbitraje de preguntas ambiguas/doble marca -- SOLO si
+                      `ia_arbitraje_habilitado=True` (default False) y solo
+                      sobre bandas con geometry_state==GEOMETRY_OK.
+                 Una respuesta resuelta por el arbitraje de IA NUNCA es una
+                 "respuesta OMR" -- se cuenta aparte (n_answers_ai vs.
+                 n_answers_omr, ver evaluar_respuestas/correr_metodo_hibrido).
+                 (app_revisor.procesar_imagen_hibrido)
 
 El motor OMR vive inline dentro de app_revisor.py (no en un módulo aparte) a
 propósito, para eliminar la posibilidad de que ese archivo y un omr.py separado
@@ -13,7 +27,8 @@ necesita directamente del código fuente de app_revisor.py, sin ejecutar su UI.
 Uso (requiere una API key de Anthropic solo para los métodos "ia" e "hibrido";
 "omr" no llama a la API y se puede correr sin key):
 
-    py omr_metrics.py --dataset dataset.json [--api-key sk-ant-...] [--metodos omr,hibrido,ia]
+    py omr_metrics.py --dataset dataset.json [--api-key sk-ant-...] \
+        [--metodos omr,hibrido,ia] [--ia-arbitraje]
 
 dataset.json tiene esta forma:
 [
@@ -22,15 +37,17 @@ dataset.json tiene esta forma:
   ...
 ]
 
-"respuestas_correctas" es la respuesta REAL que marcó el estudiante en cada
-pregunta (ground truth transcrita a mano por una persona mirando la foto), NO
-la pauta de corrección del examen — este harness mide qué tan bien cada método
-LEE la hoja, no si el alumno acertó la pregunta.
+El campo se acepta también como "ground_truth" (alias compatible, mismo
+formato) -- es la respuesta REAL que marcó el estudiante en cada pregunta
+(ground truth transcrita a mano por una persona mirando la foto). NO ES LA
+PAUTA ACADÉMICA DEL EXAMEN: este harness mide qué tan bien cada método LEE la
+hoja (qué burbuja está rellena), no si el alumno acertó la pregunta.
 
 Para cada método calcula: accuracy total, accuracy por pregunta (posición en la
 hoja), accuracy por alternativa (A/B/C/D/E), falsos positivos/negativos sobre
-"sin respuesta", % resuelto sin IA, cantidad de llamadas a Claude, tiempo
-promedio por imagen, y una matriz de confusión A-E (más "—" = sin respuesta).
+"sin respuesta", % resuelto sin IA, cantidad de llamadas a Claude (desglosadas
+por identificación vs. arbitraje), tiempo promedio por imagen, y una matriz de
+confusión A-E (más "—" = sin respuesta).
 """
 
 import argparse
@@ -189,15 +206,22 @@ def correr_metodo_ia(app_module, cliente, datos_bytes: bytes, solo_respuestas: b
             "pct_resuelto_sin_ia": 0.0, "geometry_confidence_por_banda": [], "n_geometry_error": 0}
 
 
-def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
-    """Las respuestas son 100% del motor OMR. Hay DOS llamadas a la API posibles,
-    nunca para leer burbujas: identificación de cabecera (nombre/RUT) y arbitraje
-    de las preguntas que el OMR deja genuinamente ambiguas. Antes este harness
-    asumía que la única llamada posible era la de identificación (n_llamadas = 0
-    o 1), lo que subestimaba el costo real de una hoja con ambiguas -- bug real,
-    corregido leyendo los dos conteos que ahora expone omr_meta por separado."""
+def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuestas: bool, n: int,
+                           ia_arbitraje_habilitado: bool = False) -> dict:
+    """OMR es la fuente PRIMARIA de A-E, siempre. Hay DOS llamadas a la API
+    posibles, ninguna para leer una burbuja directamente: identificación de
+    cabecera (nombre/RUT, siempre disponible) y arbitraje de las preguntas que
+    el OMR deja genuinamente ambiguas (solo si `ia_arbitraje_habilitado=True`,
+    default False -- igual que en producción). Antes este harness asumía que
+    la única llamada posible era la de identificación (n_llamadas = 0 o 1), lo
+    que subestimaba el costo real de una hoja con ambiguas -- bug real,
+    corregido leyendo los dos conteos que ahora expone omr_meta por separado.
+    Una respuesta arbitrada por IA se cuenta en n_answers_ai, NUNCA en
+    n_answers_omr -- no es lo mismo, aunque ambas terminen en el mismo array
+    `respuestas` que devuelve el híbrido."""
     t0 = time.time()
-    res = app_module.procesar_imagen_hibrido(cliente, "eval", datos_bytes, "image/jpeg", n, solo_respuestas)
+    res = app_module.procesar_imagen_hibrido(cliente, "eval", datos_bytes, "image/jpeg", n, solo_respuestas,
+                                               ia_arbitraje_habilitado=ia_arbitraje_habilitado)
     elapsed = time.time() - t0
     meta = res.get("omr_meta", {})
     n_id = meta.get("n_api_calls_identification", 0)
@@ -264,6 +288,8 @@ def main():
     ap.add_argument("--dataset", required=True, help="ruta a dataset.json")
     ap.add_argument("--api-key", default=None, help="API key de Anthropic (solo necesaria para omr/hibrido)")
     ap.add_argument("--metodos", default="omr", help="coma-separado: omr,ia,hibrido (default: solo omr, no requiere API key)")
+    ap.add_argument("--ia-arbitraje", action="store_true",
+                     help="habilita el arbitraje de IA para ambiguas en 'hibrido' (default: apagado, igual que en producción)")
     args = ap.parse_args()
 
     metodos = [m.strip() for m in args.metodos.split(",") if m.strip()]
@@ -287,7 +313,15 @@ def main():
         datos_bytes = open(caso["imagen"], "rb").read()
         n = caso["n_preguntas"]
         solo_resp = caso.get("solo_respuestas", False)
-        real = caso["respuestas_correctas"]
+        # "ground_truth" es el nombre conceptualmente correcto (alias
+        # compatible): lo que el estudiante marcó físicamente, NO la pauta
+        # académica. Se acepta también el nombre histórico del campo para no
+        # romper los fixtures ya existentes en tests/data/omr/.
+        real = caso.get("ground_truth", caso.get("respuestas_correctas"))
+        if real is None:
+            print(f"[{caso['imagen']}] sin 'ground_truth' ni 'respuestas_correctas' en el dataset -- se omite.",
+                  file=sys.stderr)
+            continue
 
         for metodo in metodos:
             try:
@@ -296,7 +330,8 @@ def main():
                 elif metodo == "ia":
                     salida = correr_metodo_ia(app_module, cliente, datos_bytes, solo_resp, n)
                 elif metodo == "hibrido":
-                    salida = correr_metodo_hibrido(app_module, cliente, datos_bytes, solo_resp, n)
+                    salida = correr_metodo_hibrido(app_module, cliente, datos_bytes, solo_resp, n,
+                                                    ia_arbitraje_habilitado=args.ia_arbitraje)
                 else:
                     continue
             except Exception as e:
