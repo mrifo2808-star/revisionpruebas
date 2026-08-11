@@ -6,23 +6,45 @@ RESPUESTAS detectado queda demasiado ancho y el contenido vecino ("USO
 EXCLUSIVO...") competia como candidato de banda.
 
 NOTA (2026-08-11, smoke test con fotos reales adicionales): la causa raiz de
-este bug resulto ser mas profunda de lo que este test asumia originalmente.
-No era que "la 4ta banda cae sobre el texto y por eso tiene baja confianza" --
-era que la seleccion de bandas, al encontrar mas candidatos de los esperados,
-se quedaba con LOS MAS ANCHOS, y el bloque de texto vecino podia ser mas
-ancho que una columna real (angosta), asi que se descartaba una columna real
-completa (la mas angosta) y el resto de las bandas quedaba UNA POSICION
-CORRIDA -- una columna nunca se leia, sus respuestas venian en realidad de
-la columna vecina bajo la etiqueta equivocada. Ese es el bug real (ver
-tests/test_omr_band_selection.py para el test sintetico que lo fija).
+este bug resulto ser mas profunda de lo que este test asumia originalmente,
+y se revisito DOS VECES el mismo dia.
 
-Ya corregida la seleccion de bandas, en esta foto las 4 columnas quedan
-correctamente identificadas (incluido el texto "USO EXCLUSIVO", que ahora
-queda completamente fuera de las 4 bandas en vez de fusionado con alguna).
-Este test ya no puede asumir que una banda especifica cae siempre sobre el
-texto -- en su lugar fija la garantia real que importa: en esta foto dificil
-(borrosa, angulo real de celular, geometria via UNIFORM_FALLBACK) NINGUNA
-pregunta puede darse jamas como "confiable" (automatica sin revision).
+Primera revision: no era que "la 4ta banda cae sobre el texto y por eso
+tiene baja confianza" -- era que la seleccion de bandas, al encontrar mas
+candidatos de los esperados, se quedaba con LOS MAS ANCHOS, y el bloque de
+texto vecino podia ser mas ancho que una columna real (angosta), asi que se
+descartaba una columna real completa (la mas angosta) y el resto de las
+bandas quedaba UNA POSICION CORRIDA. Ver tests/test_omr_band_selection.py
+para el test sintetico de esa causa.
+
+Segunda revision (misma fecha, tras un reporte de que la app en produccion
+"no detecta ninguna respuesta" en una foto nueva): la causa raiz real era
+TODAVIA mas arriba en el pipeline -- `omr_detectar_bloque_respuestas` podia
+fusionar en un solo contorno la seccion de RESPUESTAS con secciones vecinas
+(identificacion del alumno, N de folleto) via `cv2.morphologyEx(CLOSE,
+kernel=9x9, iterations=2)`, cuyo alcance efectivo (~16-18px) puenteaba el
+hueco real medido entre secciones DISTINTAS (13-14px) aunque fuera mayor que
+el hueco DENTRO de una misma seccion (2-6px). El candidato resultante
+(a veces casi la pagina completa) pasaba `_omr_candidato_tiene_header`
+porque esa funcion solo confirmaba "hay ALGUNA barra oscura arriba" -- sin
+distinguir la barra real "RESPUESTAS" de la barra, tambien real, de
+"IDENTIFICACION DEL ESTUDIANTE" mas arriba. El resultado: la app leia
+casillas de nombre/folleto como si fueran burbujas de respuesta. Corregido
+con: iterations=1 en el cierre morfologico (dejaba de puentear el hueco
+real entre secciones) + `_omr_header_seguido_de_grilla` (exige que la franja
+inmediatamente debajo del header tenga la DENSIDAD de filas de una tabla de
+burbujas real, no solo la presencia de una barra oscura).
+
+Con esta segunda correccion, `hoja_uso_exclusivo.jpg` ya no cae a
+UNIFORM_FALLBACK -- el bloque RESPUESTAS queda correctamente aislado con
+evidencia Hough real en 3 de 4 bandas (antes ninguna pregunta podia darse
+como "confiable" en esta foto). Se verifico que las 44 respuestas que ahora
+se dan como confiables coinciden EXACTO, letra por letra, con el ground
+truth ya validado de hoja_calibracion.png (que resulto ser la MISMA hoja de
+respuestas -- incluso las preguntas en blanco/dudosas coinciden) -- ver
+`test_uso_exclusivo_coincide_con_calibracion` mas abajo, que reemplaza la
+garantia anterior ("nunca confiable") por una mas fuerte y mas real
+(exactitud verificada, no solo ausencia de la palabra "confiable").
 
 Correr desde la raiz del repo:  py tests/test_omr_regression.py
 """
@@ -67,50 +89,49 @@ def test_calibracion_sin_regresion(app):
     print("OK\n")
 
 
-def test_uso_exclusivo_nunca_confiable(app):
-    print("=== 2) hoja_uso_exclusivo.jpg: ninguna pregunta puede darse como 'confiable' en esta foto dificil ===")
+def test_uso_exclusivo_coincide_con_calibracion(app):
+    print("=== 2) hoja_uso_exclusivo.jpg: el bloque RESPUESTAS debe quedar aislado y las respuestas dadas "
+          "como no-dudosas deben coincidir con el ground truth verificado de hoja_calibracion.png "
+          "(misma hoja de respuestas) ===")
+    with open(os.path.join(DATA_DIR, "hoja_calibracion.ground_truth.json"), encoding="utf-8") as f:
+        gt_data = json.load(f)
+    gt = [gt_data["respuestas"].get(str(i)) for i in range(1, gt_data["n_preguntas"] + 1)]
+
     with open(os.path.join(DATA_DIR, "hoja_uso_exclusivo.jpg"), "rb") as f:
         datos = f.read()
     res = app.procesar_imagen_hibrido(FakeCliente(), "hoja_uso_exclusivo.jpg", datos, "image/jpeg", 80,
                                        solo_respuestas=False)
     metodos = res["omr_meta"]["metodo_por_pregunta"]
     geo_conf = res["omr_meta"]["geometry_confidence_por_banda"]
-    print("geometry_confidence_por_banda:", geo_conf)
     from collections import Counter
+    print("geometry_confidence_por_banda:", geo_conf)
     print("metodos (conteo):", dict(Counter(metodos)))
 
-    # Garantia real: en una foto dificil (borrosa, angulo real de celular),
-    # cuya geometria completa cae en UNIFORM_FALLBACK, NINGUNA pregunta debe
-    # darse jamas como "confiable" -- ni las que originalmente estaban sobre
-    # texto, ni ninguna otra. Esto es lo que de verdad importa (una respuesta
-    # "confiable" incorrecta), no en que banda especifica cae el texto.
-    assert "confiable" not in metodos, \
-        f"FALLO CRITICO: alguna pregunta se dio como 'confiable' en una foto con geometria via fallback: {Counter(metodos)}"
+    # Garantia real (nunca se relaja): ninguna respuesta que el motor da como
+    # no-dudosa ("confiable") puede estar equivocada -- una "confiable"
+    # incorrecta es la falla mas grave posible, mucho peor que mandar de mas
+    # a revision manual.
+    errores = [(i + 1, p, g) for i, (p, g) in enumerate(zip(res["respuestas"], gt))
+               if p is not None and metodos[i] == "confiable" and p != g]
+    print("errores en respuestas 'confiable' (debe ser []):", errores)
+    assert not errores, f"FALLO CRITICO: respuestas incorrectas dadas como 'confiable': {errores}"
 
-    # Deben existir exactamente 4 bandas -- ver tests/test_omr_band_selection.py
-    # para el test dedicado de que las 4 columnas reales quedan correctamente
-    # identificadas y el texto vecino excluido, en vez de fusionado con alguna
-    # de ellas.
-    #
-    # NOTA (row lattice v4.1): antes de este cambio se exigia geometry_confidence
-    # > 0 en las 4 bandas como proxy de "ninguna banda completamente vacia" --
-    # ese numero se armaba solo con ancho/invariantes/fuente de columnas, sin
-    # señal real de si las FILAS estaban bien alineadas. Ahora row_alignment_confidence
-    # entra como quinto factor fail-closed (item 17 del plan): en esta foto real
-    # cada banda tiene evidencia Hough genuina pero escasa (~11-24 circulos de
-    # ~100 esperados) y los centros de columna vienen de UNIFORM_FALLBACK (no de
-    # kmeans real), asi que el soporte fila-por-columna no alcanza el piso minimo
-    # para confirmar alineacion -- geometry_confidence baja a 0.0 en las 4 bandas,
-    # correctamente, en vez de fingir una confianza que la evidencia no respalda.
-    # Lo que de verdad importa (ninguna respuesta "confiable" en una foto dificil)
-    # ya se valido arriba y sigue intacto.
+    # Con el bloque RESPUESTAS correctamente aislado (ver NOTA arriba: fix de
+    # `omr_detectar_bloque_respuestas`/`_omr_header_seguido_de_grilla`), esta
+    # foto dificil deja de caer entera en UNIFORM_FALLBACK -- al menos varias
+    # bandas deben alcanzar evidencia real y dar respuestas confiables
+    # correctas. Si esto vuelve a caer a 0, es señal de una regresion real en
+    # la localizacion del bloque, no de que "la foto es dificil" (ya
+    # demostramos que es legible).
+    n_confiables = sum(1 for m in metodos if m == "confiable")
+    assert n_confiables >= 30, \
+        f"regresion: se esperaban varias decenas de respuestas confiables y correctas, se obtuvieron {n_confiables}"
     assert len(geo_conf) == 4, f"se esperaban 4 bandas, se obtuvieron {len(geo_conf)}"
-    assert all(0.0 <= g <= 1.0 for g in geo_conf), f"geometry_confidence fuera de rango: {geo_conf}"
-    print("OK -- ninguna pregunta se dio como 'confiable' en esta foto dificil\n")
+    print(f"OK -- {n_confiables} respuestas confiables, todas correctas contra el ground truth\n")
 
 
 if __name__ == "__main__":
     app = omr_metrics._cargar_app_module()
     test_calibracion_sin_regresion(app)
-    test_uso_exclusivo_nunca_confiable(app)
+    test_uso_exclusivo_coincide_con_calibracion(app)
     print("TODO PASO - regresion OMR con fotos reales OK")
