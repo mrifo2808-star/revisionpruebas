@@ -39,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "2.3.0"
+VERSION_APP = "2.3.1"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -472,6 +472,23 @@ def llamar_claude_identificacion(cliente, header_bgr) -> dict:
         return {}
 
 
+def _analizar_imagen_omr(img_bgr, es_recorte: bool, n: int):
+    """
+    Envoltorio defensivo alrededor de omr.analizar_imagen(): si por cualquier
+    motivo el módulo omr.py que está corriendo no coincide exactamente con esta
+    versión de app_revisor.py (por ejemplo, un redeploy que por una condición de
+    carrera actualiza un archivo antes que el otro, o un entorno con una copia
+    en caché de un archivo), un parámetro nuevo puede no existir todavía del
+    otro lado. En vez de que esa sola hoja falle con un TypeError confuso, se
+    reintenta sin el parámetro opcional — se pierde esa mejora puntual para esa
+    hoja, pero el resto del pipeline sigue funcionando igual.
+    """
+    try:
+        return omr.analizar_imagen(img_bgr, es_recorte=es_recorte, n_preguntas=n)
+    except TypeError:
+        return omr.analizar_imagen(img_bgr, es_recorte=es_recorte)
+
+
 def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
     """
     Corre el motor OMR puro (sin llamadas a la API) sobre la imagen a resolución
@@ -485,7 +502,7 @@ def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict
     if img_pil is None:
         raise omr.OMRError("La imagen no se pudo decodificar.")
     img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    salida = omr.analizar_imagen(img_bgr, es_recorte=solo_respuestas, n_preguntas=n)
+    salida = _analizar_imagen_omr(img_bgr, solo_respuestas, n)
     resultados = salida["resultados"]
     n_disponibles = len(resultados)
     if n_disponibles < n:
