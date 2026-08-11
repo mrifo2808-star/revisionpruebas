@@ -46,7 +46,7 @@ div[data-testid="stFileUploader"] > div { min-height: 120px; }
 def df_pauta_vacio(n: int) -> pd.DataFrame:
     return pd.DataFrame({
         "N°": [f"P{i}" for i in range(1, n + 1)],
-        "Respuesta": [""] * n,
+        "Respuesta": pd.array([None] * n, dtype="object"),
     })
 
 def safe_key(s: str) -> str:
@@ -374,7 +374,7 @@ with tab_pauta:
             if letras:
                 st.session_state["pauta_df"] = pd.DataFrame({
                     "N°":[f"P{i}" for i in range(1,n+1)],
-                    "Respuesta":(letras+[""]*n)[:n],
+                    "Respuesta": pd.array((letras+[None]*n)[:n], dtype="object"),
                 })
                 st.success(f"✓ {min(len(letras),n)} respuestas cargadas")
                 st.rerun()
@@ -396,7 +396,7 @@ with tab_pauta:
             column_config={
                 "N°": st.column_config.TextColumn("N°", disabled=True, width="small"),
                 "Respuesta": st.column_config.SelectboxColumn(
-                    "Respuesta", options=["","A","B","C","D","E"], width="small", required=False),
+                    "Respuesta", options=["A","B","C","D","E"], width="small", required=False),
             },
             hide_index=True, height=min(38*n+40, 560),
             use_container_width=True, key="editor_pauta",
