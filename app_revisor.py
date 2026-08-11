@@ -69,30 +69,42 @@ OPCIONES = ["A", "B", "C", "D", "E", "—"]
 
 
 def prompt_dinamico(n: int) -> str:
+    num_columnas = -(-n // 20)  # división hacia arriba: esta plantilla usa columnas de 20 preguntas
+    rangos = []
+    for c in range(num_columnas):
+        ini = c * 20 + 1
+        fin = min((c + 1) * 20, n)
+        rangos.append(f"columna {c+1} = preguntas {ini} a {fin}")
+    descripcion_columnas = "; ".join(rangos)
+
     return f"""Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
+Todas las hojas que vas a revisar usan siempre la misma plantilla fija "PLANTILLA DE HOJA DE RESPUESTAS", con
+esta estructura exacta:
 
-PASO 1 — Entiende el layout antes de leer ninguna marca:
-Muchas hojas de respuestas chilenas NO son una sola lista de arriba hacia abajo: están organizadas en 2, 3 o
-4 columnas de preguntas puestas una al lado de la otra (por ejemplo, preguntas 1-20 en la primera columna,
-21-40 en la segunda, 41-60 en la tercera, etc). Antes de leer ninguna marca, identifica cuántas columnas de
-preguntas tiene esta hoja específica y en qué número empieza y termina cada una.
+- Arriba a la izquierda, "IDENTIFICACIÓN DEL ESTUDIANTE": Apellido Paterno, Apellido Materno y Nombres,
+  escritos A MANO, una letra por casillero (no son burbujas).
+- Arriba a la derecha, "CÉDULA DE IDENTIDAD": los dígitos pueden venir escritos a mano en la fila superior de
+  esa sección y/o marcados con burbujas (una columna de burbujas 0-9 por cada dígito). Si el texto a mano es
+  legible, úsalo como fuente principal del RUT; si no, complétalo leyendo qué burbuja está marcada en cada
+  columna de dígito. Ignora el recuadro "PASAPORTE" (normalmente vacío).
+- Más abajo a la izquierda, casilleros separados de "N° DE FOLLETO", "SEDE", "LOCAL" y "SALA" — a menudo
+  vienen vacíos; si no hay nada escrito ahí, deja "nro_folleto" como cadena vacía.
+- El bloque grande "RESPUESTAS" está dividido en columnas de 20 preguntas cada una, puestas una al lado de la
+  otra de izquierda a derecha: {descripcion_columnas}. Dentro de cada columna, cada fila tiene el número de
+  pregunta impreso a la izquierda seguido de 5 burbujas A-E.
 
-PASO 2 — Usa el número IMPRESO, nunca el orden de lectura:
-Cada fila tiene un número de pregunta impreso junto a las burbujas A-E (ej. "21 (A)(B)(C)(D)(E)"). Ese número
-impreso es la única fuente de verdad sobre a qué pregunta corresponde esa fila — NO asumas que la fila que ves
-"más abajo" o "en la posición 21 según fuiste mirando" es la pregunta 21. Verifica el número impreso de cada
-fila antes de registrar su respuesta.
+PASO 1 — Usa el número IMPRESO de cada fila, nunca el orden espacial en que la vas mirando. Por ejemplo, la
+fila que dice "21" al lado de las burbujas es la pregunta 21 sin importar en qué columna esté ni si la miraste
+antes o después que la fila "5" — no asumas que "la siguiente fila hacia abajo" continúa la numeración de la
+columna anterior; cada columna empieza y termina en el rango indicado arriba.
 
-PASO 3 — Registra cada respuesta en el índice correcto del arreglo:
-El arreglo "respuestas" tiene {n} posiciones, donde la posición 1 = pregunta impresa "1", la posición 2 =
-pregunta impresa "2", y así sucesivamente — sin importar en qué orden espacial las hayas ido mirando en la
-imagen (por columnas, no de arriba a abajo en un solo bloque).
+PASO 2 — Registra cada respuesta en el índice del arreglo que corresponde exactamente a su número de pregunta
+impreso (posición 1 = pregunta "1", posición 21 = pregunta "21", etc.), recorriendo columna por columna.
 
-PASO 4 — Verifica antes de responder:
-Revisa que el arreglo "respuestas" tenga exactamente {n} elementos y que corresponda una posición por cada
-número de pregunta impreso en la hoja, del 1 al {n}, sin saltos ni desplazamientos. Luego, vuelve a mirar por
-segunda vez SOLO las preguntas donde no quedaste 100% seguro de cuál opción marcó el estudiante, y confírmalas
-con calma.
+PASO 3 — Antes de responder, verifica que el arreglo "respuestas" tenga exactamente {n} elementos, uno por
+cada número de pregunta impreso del 1 al {n} sin saltos ni desplazamientos. Luego vuelve a mirar por segunda
+vez SOLO las preguntas donde no quedaste 100% seguro de cuál opción marcó el estudiante, y confírmalas con
+calma.
 
 Criterio simple para "dudosas" — marca una pregunta como dudosa ÚNICAMENTE si, tras esa segunda mirada, sigue
 existiendo un riesgo real de haber leído mal la intención del estudiante (ejemplos: dos opciones con marca
