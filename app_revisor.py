@@ -93,9 +93,31 @@ OMR_THRESHOLDS = {
     "MIN_GEOMETRY_CONFIDENCE": 0.5,  # por debajo de esto, la banda no tiene evidencia real de ser
                                       # una grilla de burbujas (pudo caer sobre texto/margen vecino) --
                                       # ninguna pregunta de esa banda puede darse como confiable
+                                      # (estado GEOMETRY_ERROR)
+    "WARNING_GEOMETRY_CONFIDENCE": 0.8,  # entre este valor y MIN_GEOMETRY_CONFIDENCE: geometría
+                                          # aceptable pero con alguna señal débil (spacing irregular,
+                                          # radio cerca del límite) -- estado GEOMETRY_WARNING, la
+                                          # pregunta puede seguir siendo confiable pero queda marcada
+                                          # para que un diagnóstico visual la destaque
 }
 OMR_N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
 OMR_LETRAS = ["A", "B", "C", "D", "E"]
+
+# Perfil de la plantilla física impresa. Existe para que el N máximo de
+# preguntas configurable en la UI (más abajo) no pueda superar lo que la
+# hoja física puede mostrar -- antes la UI aceptaba hasta 120 preguntas
+# aunque la plantilla real solo tiene 4 bloques x 20 filas = 80, una
+# contradicción real entre estructura física e input arbitrario. Un formato
+# de hoja distinto en el futuro sería OTRO perfil, no un N más grande sobre
+# este mismo.
+TEMPLATE_PROFILE = {
+    "id": "PAES_80_V1",
+    "n_bloques_max": 4,
+    "n_filas_por_bloque": OMR_N_FILAS_POR_BLOQUE,
+    "n_alternativas": len(OMR_LETRAS),
+    "n_max": 4 * OMR_N_FILAS_POR_BLOQUE,  # 80 -- techo físico real de esta plantilla
+}
+OMR_MAX_BANDAS = TEMPLATE_PROFILE["n_bloques_max"]
 
 
 class OMRError(Exception):
@@ -239,7 +261,7 @@ def _omr_bandas_por_gaps(col_smooth, bw, umbral):
     return bands, mask
 
 
-def omr_detectar_header_y_bandas(gray, max_bandas=4, bandas_esperadas=None, permitir_reparto_geometrico=True):
+def omr_detectar_header_y_bandas(gray, max_bandas=OMR_MAX_BANDAS, bandas_esperadas=None, permitir_reparto_geometrico=True):
     """
     Devuelve (header_bottom, bandas) donde bandas es una lista de (x0,x1) — una
     por cada bloque de 20 preguntas visible en la imagen (1 a 4). header_bottom=0
@@ -319,6 +341,96 @@ def _omr_y_centers_uniforme(bh, n_filas):
     return np.linspace(margen_y, bh - margen_y, n_filas)
 
 
+def _omr_validar_invariantes_banda(y_centers, x_centers, radio, bh, bw, n_filas):
+    """
+    Invariantes geométricos duros sobre la grilla YA ajustada de una banda --
+    protección estructural (no estadística) contra la misma familia del bug
+    "USO EXCLUSIVO" y otros desplazamientos/columnas mal separadas: en una
+    grilla real de 5 columnas (A-E) x n_filas sobre burbujas impresas, estas
+    condiciones no pueden fallar. Se validan aparte de la consistencia de
+    ancho entre bandas (que ya cubre `omr_ajustar_grilla`) porque son señales
+    independientes -- una banda puede tener un ancho parecido a sus hermanas
+    y aun así tener una grilla interna inválida (columnas colapsadas, filas
+    fuera de la imagen, spacing irregular).
+
+    Devuelve (multiplicador, violaciones): multiplicador en [0, 1] para
+    aplicar sobre geometry_confidence (0.0 = geometría no demostrable, así
+    haya "tinta oscura" ahí) y la lista de nombres de invariantes que
+    fallaron o quedaron al límite, para diagnóstico (nunca para crashear).
+    """
+    violaciones = []
+    multiplicador = 1.0
+    x_centers = np.asarray(x_centers, dtype=np.float64)
+    y_centers = np.asarray(y_centers, dtype=np.float64)
+
+    # xA < xB < xC < xD < xE y y1 < y2 < ... < y_n: por construcción kmeans +
+    # sort ya lo garantiza, pero un colapso de clusters (círculos agrupados
+    # mal) puede dejar centros casi idénticos sin violar el orden estricto,
+    # así que igual se revisa aparte más abajo vía spacing.
+    if len(x_centers) != 5 or np.any(np.diff(x_centers) <= 0):
+        violaciones.append("orden_columnas_A_E")
+        multiplicador = 0.0
+    if len(y_centers) != n_filas or np.any(np.diff(y_centers) <= 0):
+        violaciones.append("orden_filas")
+        multiplicador = 0.0
+
+    # Spacing horizontal/vertical estable: layout impreso uniforme -> un
+    # spacing muy irregular indica clusters que no corresponden a burbujas
+    # reales en esa posición (p.ej. un outlier arrastrado por ruido).
+    if len(x_centers) == 5:
+        dx = np.diff(x_centers)
+        cv_x = float(dx.std() / max(dx.mean(), 1e-6))
+        if cv_x > 0.6:
+            violaciones.append("spacing_horizontal_irregular")
+            multiplicador = 0.0
+        elif cv_x > 0.3:
+            violaciones.append("spacing_horizontal_alerta")
+            multiplicador = min(multiplicador, 0.6)
+    if len(y_centers) == n_filas:
+        dy = np.diff(y_centers)
+        cv_y = float(dy.std() / max(dy.mean(), 1e-6))
+        if cv_y > 0.6:
+            violaciones.append("spacing_vertical_irregular")
+            multiplicador = 0.0
+        elif cv_y > 0.3:
+            violaciones.append("spacing_vertical_alerta")
+            multiplicador = min(multiplicador, 0.6)
+
+    # ROIs dentro de límites de la imagen. El CENTRO de cada burbuja tiene que
+    # estar dentro de la banda sin excepción (si no, la grilla está mal
+    # ubicada). El círculo de MUESTREO de la fila/columna extrema sí puede
+    # sobrepasar el borde por un margen chico sin que sea un problema real --
+    # por diseño esas burbujas quedan pegadas al borde de la banda, así que
+    # un overshoot del orden del radio es esperable, no una señal de error.
+    if len(x_centers) and len(y_centers):
+        centro_fuera = (x_centers.min() < 0 or x_centers.max() > bw or
+                         y_centers.min() < 0 or y_centers.max() > bh)
+        if centro_fuera:
+            violaciones.append("centro_fuera_de_banda")
+            multiplicador = 0.0
+        else:
+            overshoot = max(0.0,
+                             radio - x_centers.min(), (x_centers.max() + radio) - bw,
+                             radio - y_centers.min(), (y_centers.max() + radio) - bh)
+            tolerancia = max(radio * 1.2, 2.0)
+            if overshoot > tolerancia * 3:
+                violaciones.append("roi_fuera_de_banda")
+                multiplicador = 0.0
+            elif overshoot > tolerancia:
+                violaciones.append("roi_cerca_del_borde")
+                multiplicador = min(multiplicador, 0.7)
+
+    # Ninguna burbuja debería solaparse de forma absurda con su vecina: el
+    # radio de muestreo no puede superar la mitad del spacing mínimo real.
+    if len(x_centers) == 5 and len(y_centers) == n_filas and radio > 0:
+        min_spacing = min(np.diff(x_centers).min(), np.diff(y_centers).min())
+        if radio * 1.6 > min_spacing:
+            violaciones.append("radio_excede_spacing")
+            multiplicador = min(multiplicador, 0.5)
+
+    return multiplicador, violaciones
+
+
 def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
     """Ajusta, PARA CADA BANDA POR SEPARADO, sus 20 centros de fila y sus 5 centros
     de columna, usando detección de círculos (Hough) + kmeans 1D. Si Hough no
@@ -344,7 +456,15 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
     encontrar en TODAS las bandas por igual (ninguna razón para desconfiar más de
     una banda que de otra por eso), así que el conteo de Hough se usa solo como
     piso de "banda completamente vacía", no como score graduado -- el score
-    graduado real es la consistencia de ancho entre bandas hermanas."""
+    graduado real es la consistencia de ancho entre bandas hermanas.
+
+    Además, sobre la grilla YA ajustada de cada banda se valida un tercer
+    conjunto de señales independiente: los invariantes geométricos duros de
+    `_omr_validar_invariantes_banda` (orden y spacing de columnas/filas, ROIs
+    dentro de la banda, radio vs. spacing). Una banda puede tener un ancho
+    parecido a sus hermanas y aun así tener una grilla interna inválida, así
+    que las tres señales se combinan multiplicando (cualquiera puede llevar
+    geometry_confidence a 0 por sí sola -- fail closed, no promedio)."""
     bh, bw = body_gray.shape
     blur = cv2.medianBlur(body_gray, 3)
     anchos = [x1 - x0 for x0, x1 in bands]
@@ -359,40 +479,72 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
     pts = circles[0] if circles is not None else np.empty((0, 3))
     esperados = 5 * n_filas
 
-    y_centers_por_banda, band_x_centers, radios, geometry_confidence = [], [], [], []
+    y_centers_por_banda, band_x_centers, radios = [], [], []
+    geometry_confidence, geometry_violaciones = [], []
     for (x0, x1) in bands:
         sel = pts[(pts[:, 0] >= x0) & (pts[:, 0] < x1)]
         ancho_conf = min(x1 - x0, ancho_mediano) / max(x1 - x0, ancho_mediano, 1e-6)
         banda_vacia = len(sel) < max(3, esperados * 0.03)  # casi ningún círculo real -> no hay grilla ahí
-        geometry_confidence.append(0.0 if banda_vacia else ancho_conf)
         if len(sel) >= max(5 * n_filas * 0.35, 10):
-            y_centers_por_banda.append(_omr_kmeans_1d(sel[:, 1], n_filas))
-            band_x_centers.append(_omr_kmeans_1d(sel[:, 0], 5))
-            radios.append(float(np.median(sel[:, 2])))
+            y_c = _omr_kmeans_1d(sel[:, 1], n_filas)
+            x_c = _omr_kmeans_1d(sel[:, 0], 5)
+            r_banda = float(np.median(sel[:, 2]))
         else:
-            y_centers_por_banda.append(_omr_y_centers_uniforme(bh, n_filas))
+            y_c = _omr_y_centers_uniforme(bh, n_filas)
             bw_band = x1 - x0
             num_w = bw_band * 0.18
-            xs = x0 + num_w + (np.arange(5) + 0.5) * ((bw_band - num_w) / 5)
-            band_x_centers.append(xs)
-            radios.append(max(3.0, min_band_w * 0.08))
+            x_c = x0 + num_w + (np.arange(5) + 0.5) * ((bw_band - num_w) / 5)
+            r_banda = max(3.0, min_band_w * 0.08)
+        y_centers_por_banda.append(y_c)
+        band_x_centers.append(x_c)
+        radios.append(r_banda)
+
+        mult_inv, violaciones = _omr_validar_invariantes_banda(y_c, x_c, r_banda, bh, bw, n_filas)
+        if banda_vacia:
+            violaciones = ["banda_sin_evidencia_circulos"] + violaciones
+        geometry_confidence.append(0.0 if banda_vacia else ancho_conf * mult_inv)
+        geometry_violaciones.append(violaciones)
 
     radio = float(np.median(radios))
-    return np.array(y_centers_por_banda), np.array(band_x_centers), radio, geometry_confidence
+    return np.array(y_centers_por_banda), np.array(band_x_centers), radio, geometry_confidence, geometry_violaciones
 
 
-def _omr_oscuridad_celda(gray, cx, cy, r):
+def _omr_oscuridad_celda(gray, cx, cy, r, r_inner_frac=0.6):
+    """
+    Cuánto más oscuro está el INTERIOR de una burbuja que el fondo de papel en
+    blanco. Antes se promediaba un parche cuadrado completo alrededor del
+    centro, que mezcla el borde impreso del círculo, la letra impresa
+    (A/B/C/D/E, que en esta plantilla queda cerca del borde) y el grafito
+    real -- una burbuja VACÍA con su letra bien impresa podía dar casi la
+    misma oscuridad promedio que una burbuja tenue pero realmente marcada.
+
+    Ahora se recorta un parche del tamaño del radio completo (para tener
+    contexto) pero se promedia solo dentro de una MÁSCARA CIRCULAR interna
+    (r_inner = r_inner_frac * r, 0.6 por defecto -- dentro del rango 0.55-0.70
+    esperable para que el borde y la letra impresa aporten mucho menos peso
+    que el centro real de la burbuja, que es donde cae el grafito cuando se
+    rellena)."""
     x0, x1 = max(0, int(cx - r)), int(cx + r + 1)
     y0, y1 = max(0, int(cy - r)), int(cy + r + 1)
     patch = gray[y0:y1, x0:x1]
     if patch.size == 0:
         return 0.0
-    return 255.0 - float(patch.mean())
+    ph, pw = patch.shape
+    yy, xx = np.ogrid[:ph, :pw]
+    cy_local, cx_local = cy - y0, cx - x0
+    r_inner = max(1.0, r * r_inner_frac)
+    mask_inner = (xx - cx_local) ** 2 + (yy - cy_local) ** 2 <= r_inner ** 2
+    if not mask_inner.any():
+        return 255.0 - float(patch.mean())
+    return 255.0 - float(patch[mask_inner].mean())
 
 
 def omr_calcular_puntajes(body_gray, y_centers_por_banda, band_x_centers, radio):
-    """Devuelve lista de dicts {A:.., B:.., ..} de oscuridad cruda por pregunta, en orden P1..Pn."""
-    sample_r = max(2.0, radio * 0.75)
+    """Devuelve lista de dicts {A:.., B:.., ..} de oscuridad cruda por pregunta, en orden P1..Pn.
+    El parche de cada celda usa el radio completo de la burbuja (más contexto que antes),
+    pero la máscara interna dentro de _omr_oscuridad_celda es la que de verdad decide qué
+    píxeles cuentan para el score."""
+    sample_r = max(2.0, radio * 0.9)
     filas = []
     for bi, band_x in enumerate(band_x_centers):
         for cy in y_centers_por_banda[bi]:
@@ -490,6 +642,13 @@ def omr_anotar_diagnostico(body_bgr, y_centers_por_banda, band_x_centers, radio,
             cv2.circle(dbg, (int(band_x[0] * escala - radio * escala), int(cy)), 3 * escala, color, -1)
         conf_pct = round(r.get("omr_confidence", 0) * 100)
         label = f"{q}:{r['letra'] or '?'} {conf_pct}%"
+        geo_state = r.get("geometry_state")
+        if geo_state in ("GEOMETRY_WARNING", "GEOMETRY_ERROR"):
+            # Solo se agrega geometry_confidence a la etiqueta cuando NO es
+            # GEOMETRY_OK -- mostrarlo siempre en las 80 preguntas satura la
+            # imagen; el caso que de verdad hay que poder verificar a simple
+            # vista es justamente cuándo la geometría es dudosa o falló.
+            label += f" g{round(r.get('geometry_confidence', 0) * 100)}%"
         cv2.putText(dbg, label, (int(band_x[0] * escala - radio * 3.4 * escala), int(cy) - int(radio * escala) - 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.32 * escala / 2, color, 1, cv2.LINE_AA)
     return dbg
@@ -539,7 +698,7 @@ def _omr_escalar_para_deteccion(img_bgr, ancho_referencia):
     return img_esc, escala
 
 
-def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
+def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_preguntas=None):
     """
     Punto de entrada principal del motor OMR: toma una imagen ya cargada (BGR,
     resolución original, SIN recomprimir) y devuelve la grilla ajustada +
@@ -579,7 +738,8 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         gray_det, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
         permitir_reparto_geometrico=not es_recorte)
     body_gray_det = gray_det[header_bottom_det:, :]
-    y_centers_det, band_x_centers_det, radio_det, geometry_confidence = omr_ajustar_grilla(body_gray_det, bands_det)
+    y_centers_det, band_x_centers_det, radio_det, geometry_confidence, geometry_violaciones = omr_ajustar_grilla(
+        body_gray_det, bands_det)
 
     # Escalar toda la geometría encontrada de vuelta a la resolución original
     # antes de medir -- la medición de oscuridad y los recortes de preguntas
@@ -606,16 +766,25 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         baseline = float(np.percentile(banda_vals, 15))
         peak = float(np.percentile(banda_vals, 97))
         geo_conf = geometry_confidence[bi]
+        if geo_conf < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]:
+            geo_estado = "GEOMETRY_ERROR"
+        elif geo_conf < OMR_THRESHOLDS["WARNING_GEOMETRY_CONFIDENCE"]:
+            geo_estado = "GEOMETRY_WARNING"
+        else:
+            geo_estado = "GEOMETRY_OK"
         for s in banda_scores:
             r = omr_clasificar_pregunta(s, baseline, peak)
             r["geometry_confidence"] = round(geo_conf, 3)
-            if geo_conf < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]:
-                # Sin evidencia real (círculos Hough) de que esta banda sea una
-                # grilla de burbujas -- pudo caer sobre margen en blanco o texto
-                # vecino. No importa qué tan "clara" parezca la marca: medir
-                # oscuridad sobre la zona equivocada puede dar una lectura con
-                # apariencia de alta confianza pero completamente falsa. Se
-                # fuerza a revisión manual en vez de devolver una letra.
+            r["geometry_state"] = geo_estado
+            r["geometry_violaciones"] = geometry_violaciones[bi]
+            if geo_estado == "GEOMETRY_ERROR":
+                # Sin evidencia real (círculos Hough + invariantes de grilla) de
+                # que esta banda sea una grilla de burbujas -- pudo caer sobre
+                # margen en blanco o texto vecino. No importa qué tan "clara"
+                # parezca la marca: medir oscuridad sobre la zona equivocada
+                # puede dar una lectura con apariencia de alta confianza pero
+                # completamente falsa. Se fuerza a revisión manual en vez de
+                # devolver una letra -- fail closed, nunca se fabrica geometría.
                 r["letra"] = None
                 r["status"] = "geometry_error"
             resultados.append(r)
@@ -627,6 +796,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         "radio": radio,
         "n_bandas": len(band_x_centers),
         "geometry_confidence_por_banda": [round(g, 3) for g in geometry_confidence],
+        "geometry_violaciones_por_banda": geometry_violaciones,
         "resultados": resultados,
     }
 
@@ -1243,7 +1413,15 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
     for i, r in enumerate(resultados):
         q = i + 1
         letra, status = r["letra"], r["status"]
-        if status == "alta_confianza":
+        if status == "alta_confianza" and r.get("geometry_state") == "GEOMETRY_WARNING":
+            # mark_confidence alto, pero geometry_confidence solo "aceptable con
+            # reservas" (spacing irregular, radio cerca del límite, etc.) -- por
+            # el principio geometry AND mark, no basta con que la marca se vea
+            # clara para dar la pregunta como automática; se degrada a revisión
+            # rápida en vez de "confiable" ciego.
+            metodo = "revisar_media"
+            dudosas.append(q)
+        elif status == "alta_confianza":
             metodo = "confiable"
         elif status == "confianza_media":
             # se usa el propio mejor candidato del motor, pero queda marcada
@@ -1291,9 +1469,11 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
     # ambiguas (doble marca o dos burbujas con tinta pareja), nunca para las que
     # ya tienen una respuesta confiable o de confianza media. Si la IA tampoco
     # logra decidir, la pregunta se deja igual para revisión manual.
+    n_api_calls_answer_arbitration = 0
     if ambiguas_para_ia and cliente is not None:
         crops_para_ia = [(q, crops_bgr_dudosas[q]) for q in ambiguas_para_ia if q in crops_bgr_dudosas]
         if crops_para_ia:
+            n_api_calls_answer_arbitration = 1  # una sola llamada batcheada para todas las ambiguas de esta hoja
             try:
                 resueltas_ia = llamar_claude_revision_dudosas(cliente, crops_para_ia)
             except Exception:
@@ -1304,6 +1484,20 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
                     respuestas[idx] = letra_ia
                     metodo_por_pregunta[idx] = "revisada_ia"
                     dudosas.remove(q)
+
+    # Conteo real de cómo se resolvió cada pregunta -- separado de las llamadas
+    # a la API (arriba) porque antes omr_metrics.py asumía que la única
+    # llamada posible del híbrido era la de identificación, sin contar la de
+    # arbitraje de dudosas, lo que invalidaba esa métrica de costo (bug real,
+    # corregido acá exponiendo ambos conteos por separado).
+    n_answers_omr = sum(1 for m in metodo_por_pregunta if m in ("confiable", "revisar_media", "blanco"))
+    n_answers_ai = sum(1 for m in metodo_por_pregunta if m == "revisada_ia")
+    # No hay corrección manual dentro de este pipeline offline (ni en el harness
+    # de métricas): "manual" ocurre después, en la UI, cuando la persona corrige
+    # una dudosa -- este conteo siempre es 0 acá a propósito, no un placeholder
+    # que se olvidó de llenar.
+    n_answers_manual = 0
+    n_answers_unresolved = sum(1 for m in metodo_por_pregunta if m in ("revisar_dudoso", "revisar_geometria"))
 
     res = {
         "respuestas": respuestas,
@@ -1321,14 +1515,24 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
             "n_confiable": sum(1 for m in metodo_por_pregunta if m in ("confiable", "blanco")),
             "n_dudosas": len(dudosas),
             "geometry_confidence_por_banda": salida.get("geometry_confidence_por_banda", []),
+            "geometry_violaciones_por_banda": salida.get("geometry_violaciones_por_banda", []),
             "n_geometry_error": sum(1 for m in metodo_por_pregunta if m == "revisar_geometria"),
+            "n_geometry_warning": sum(1 for r in resultados if r.get("geometry_state") == "GEOMETRY_WARNING"),
+            "n_answers_omr": n_answers_omr,
+            "n_answers_ai": n_answers_ai,
+            "n_answers_manual": n_answers_manual,
+            "n_answers_unresolved": n_answers_unresolved,
+            "n_api_calls_answer_arbitration": n_api_calls_answer_arbitration,
+            "n_api_calls_identification": 0,  # se corrige más abajo si de verdad se intenta la llamada
         },
     }
 
     # Datos del alumno: solo si la imagen es la hoja completa (en modo
-    # solo_respuestas no hay cabecera que leer, igual que en el flujo 100%-IA).
-    # Esta es la ÚNICA llamada a Claude en todo este pipeline — nunca toca respuestas.
-    if not solo_respuestas:
+    # solo_respuestas no hay cabecera que leer, igual que en el flujo 100%-IA)
+    # y hay un cliente real disponible -- nunca toca respuestas, es la única
+    # llamada de identificación en todo este pipeline.
+    if not solo_respuestas and cliente is not None:
+        res["omr_meta"]["n_api_calls_identification"] = 1
         quad = salida.get("quad_respuestas")
         img_bgr = salida["img_bgr_original"]
         top_tabla = int(min(p[1] for p in quad)) if quad is not None else int(img_bgr.shape[0] * 0.5)
@@ -1552,7 +1756,7 @@ with st.sidebar:
     st.markdown("**Número de preguntas**")
     n_prev = st.session_state["n_preguntas"]
     hay_procesadas = bool(st.session_state["resultados"])
-    n_nuevo = st.number_input("Preguntas", min_value=1, max_value=120,
+    n_nuevo = st.number_input("Preguntas", min_value=1, max_value=TEMPLATE_PROFILE["n_max"],
                                value=n_prev, step=1, label_visibility="collapsed",
                                disabled=hay_procesadas)
     if hay_procesadas:

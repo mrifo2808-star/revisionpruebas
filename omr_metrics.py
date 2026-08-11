@@ -37,7 +37,7 @@ import argparse
 import json
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import cv2
 import numpy as np
@@ -63,22 +63,33 @@ def imprimir_matriz(cm):
         print(f"{real:>4}  {fila}")
 
 
-def evaluar_respuestas(pred: list, real: list, estados: list = None, etiquetas_confiables: set = None) -> dict:
-    """Si se pasan `estados` (el status/metodo por pregunta que devolvió el motor) y
+def evaluar_respuestas(pred: list, real: list, estados: list = None,
+                        etiquetas_confiables: set = None, etiquetas_media: set = None) -> dict:
+    """Si se pasan `estados` (el status/metodo por pregunta que devolvió el motor),
     `etiquetas_confiables` (qué estados cuentan como "el motor dice que esto es
-    confiable"), además calcula high-confidence precision/coverage: de las
-    preguntas que el motor entregó como confiables, qué fracción realmente
-    coincide con el ground truth. Esta es la métrica más importante del sistema
-    -- una respuesta "confiable" incorrecta es la falla más peligrosa posible,
-    mucho peor que dejar una pregunta dudosa para revisión manual."""
+    confiable") y `etiquetas_media` (estados de confianza media), además calcula:
+
+    - HIGH-CONFIDENCE precision/coverage: de las preguntas que el motor entregó
+      como confiables, qué fracción realmente coincide con el ground truth --
+      la métrica más importante del sistema, una respuesta "confiable"
+      incorrecta es la falla más peligrosa posible, mucho peor que dejar una
+      pregunta dudosa para revisión manual.
+    - MEDIUM-CONFIDENCE precision: lo mismo pero sobre las de confianza media.
+    - blank precision/recall: de las preguntas que el motor dice "en blanco",
+      cuántas realmente lo estaban (precision), y de las que realmente estaban
+      en blanco, cuántas el motor efectivamente marcó como tal (recall).
+    - un Counter() de los estados crudos, para que quien llama derive tasas
+      específicas del método (ambiguo, doble_marca, geometry_error, etc.) sin
+      que esta función tenga que conocer el vocabulario de cada método."""
     n = len(real)
     aciertos = 0
     fp_sin_respuesta = 0  # dijo letra, era None
     fn_sin_respuesta = 0  # dijo None, había letra
     cm = matriz_confusion_vacia()
     por_pregunta = []
-    n_alta_confianza = 0
-    aciertos_alta_confianza = 0
+    n_alta_confianza = aciertos_alta_confianza = 0
+    n_media = aciertos_media = 0
+    pred_blank = real_blank = blank_correcto = 0
     for i in range(n):
         p, r = pred[i] if i < len(pred) else None, real[i]
         ok = (p == r)
@@ -89,9 +100,19 @@ def evaluar_respuestas(pred: list, real: list, estados: list = None, etiquetas_c
             fp_sin_respuesta += 1
         if r is not None and p is None:
             fn_sin_respuesta += 1
-        if estados and etiquetas_confiables and i < len(estados) and estados[i] in etiquetas_confiables:
-            n_alta_confianza += 1
-            aciertos_alta_confianza += ok
+        if p is None:
+            pred_blank += 1
+        if r is None:
+            real_blank += 1
+        if p is None and r is None:
+            blank_correcto += 1
+        if estados and i < len(estados):
+            if etiquetas_confiables and estados[i] in etiquetas_confiables:
+                n_alta_confianza += 1
+                aciertos_alta_confianza += ok
+            if etiquetas_media and estados[i] in etiquetas_media:
+                n_media += 1
+                aciertos_media += ok
     return {
         "accuracy": aciertos / n if n else 0.0,
         "aciertos": aciertos, "n": n,
@@ -101,11 +122,43 @@ def evaluar_respuestas(pred: list, real: list, estados: list = None, etiquetas_c
         "por_pregunta": por_pregunta,
         "n_alta_confianza": n_alta_confianza,
         "aciertos_alta_confianza": aciertos_alta_confianza,
+        "n_media": n_media,
+        "aciertos_media": aciertos_media,
+        "pred_blank": pred_blank, "real_blank": real_blank, "blank_correcto": blank_correcto,
+        "estados_counter": Counter(estados) if estados else Counter(),
     }
 
 
 ESTADOS_CONFIABLES_OMR = {"alta_confianza"}
+ESTADOS_MEDIA_OMR = {"confianza_media"}
+ESTADOS_AMBIGUOS_OMR = {"ambiguo"}
+ESTADOS_DOBLE_MARCA_OMR = {"doble_marca"}
+ESTADOS_GEOMETRY_ERROR_OMR = {"geometry_error"}
+
 ESTADOS_CONFIABLES_HIBRIDO = {"confiable"}
+ESTADOS_MEDIA_HIBRIDO = {"revisar_media"}
+ESTADOS_MANUAL_REVIEW_HIBRIDO = {"revisar_dudoso", "revisar_geometria"}
+ESTADOS_AI_HIBRIDO = {"revisada_ia"}
+ESTADOS_GEOMETRY_ERROR_HIBRIDO = {"revisar_geometria"}
+
+# Qué tasas derivar del Counter de estados crudos de cada método -- el
+# vocabulario de estados NO es el mismo entre "omr" puro (alta_confianza,
+# confianza_media, ambiguo, doble_marca, geometry_error, sin_marca) e
+# "hibrido" (confiable, revisar_media, revisar_dudoso, revisar_geometria,
+# revisada_ia, blanco), así que cada método declara aparte qué estados
+# cuentan para cada tasa reportada.
+METODO_TASAS = {
+    "omr": {
+        "ambiguous_rate": ESTADOS_AMBIGUOS_OMR,
+        "double_mark_rate": ESTADOS_DOBLE_MARCA_OMR,
+        "geometry_error_rate": ESTADOS_GEOMETRY_ERROR_OMR,
+    },
+    "hibrido": {
+        "manual_review_rate": ESTADOS_MANUAL_REVIEW_HIBRIDO,
+        "AI_arbitration_rate": ESTADOS_AI_HIBRIDO,
+        "geometry_error_rate": ESTADOS_GEOMETRY_ERROR_HIBRIDO,
+    },
+}
 
 
 def correr_metodo_omr(app_module, datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
@@ -118,8 +171,9 @@ def correr_metodo_omr(app_module, datos_bytes: bytes, solo_respuestas: bool, n: 
     elapsed = time.time() - t0
     n_directo = sum(1 for r in resultados if r["status"] in ("alta_confianza", "confianza_media"))
     n_geo_error = sum(1 for r in resultados if r["status"] == "geometry_error")
-    return {"respuestas": respuestas, "estados": estados, "etiquetas_confiables": ESTADOS_CONFIABLES_OMR,
-            "tiempo_s": elapsed, "llamadas_api": 0,
+    return {"respuestas": respuestas, "estados": estados,
+            "etiquetas_confiables": ESTADOS_CONFIABLES_OMR, "etiquetas_media": ESTADOS_MEDIA_OMR,
+            "tiempo_s": elapsed, "llamadas_api": 0, "n_api_calls_identification": 0, "n_api_calls_answer_arbitration": 0,
             "pct_resuelto_sin_ia": n_directo / n if n else 0.0,
             "geometry_confidence_por_banda": salida.get("geometry_confidence_por_banda", []),
             "n_geometry_error": n_geo_error}
@@ -129,25 +183,36 @@ def correr_metodo_ia(app_module, cliente, datos_bytes: bytes, solo_respuestas: b
     t0 = time.time()
     res = app_module.procesar_imagen(cliente, "eval", datos_bytes, "image/jpeg", n, solo_respuestas)
     elapsed = time.time() - t0
-    return {"respuestas": res["respuestas"], "estados": [], "etiquetas_confiables": set(),
-            "tiempo_s": elapsed, "llamadas_api": res.get("intentos", 1), "pct_resuelto_sin_ia": 0.0,
-            "geometry_confidence_por_banda": [], "n_geometry_error": 0}
+    return {"respuestas": res["respuestas"], "estados": [], "etiquetas_confiables": set(), "etiquetas_media": set(),
+            "tiempo_s": elapsed, "llamadas_api": res.get("intentos", 1),
+            "n_api_calls_identification": res.get("intentos", 1), "n_api_calls_answer_arbitration": 0,
+            "pct_resuelto_sin_ia": 0.0, "geometry_confidence_por_banda": [], "n_geometry_error": 0}
 
 
 def correr_metodo_hibrido(app_module, cliente, datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
-    """Las respuestas son 100% del motor OMR; la única llamada a la API (si la hay) es
-    para transcribir nombre/RUT de la cabecera -- nunca para leer burbujas."""
+    """Las respuestas son 100% del motor OMR. Hay DOS llamadas a la API posibles,
+    nunca para leer burbujas: identificación de cabecera (nombre/RUT) y arbitraje
+    de las preguntas que el OMR deja genuinamente ambiguas. Antes este harness
+    asumía que la única llamada posible era la de identificación (n_llamadas = 0
+    o 1), lo que subestimaba el costo real de una hoja con ambiguas -- bug real,
+    corregido leyendo los dos conteos que ahora expone omr_meta por separado."""
     t0 = time.time()
     res = app_module.procesar_imagen_hibrido(cliente, "eval", datos_bytes, "image/jpeg", n, solo_respuestas)
     elapsed = time.time() - t0
     meta = res.get("omr_meta", {})
-    n_llamadas = 0 if (res.get("solo_respuestas") or not meta.get("usado")) else 1  # solo identificación
+    n_id = meta.get("n_api_calls_identification", 0)
+    n_arb = meta.get("n_api_calls_answer_arbitration", 0)
     return {"respuestas": res["respuestas"], "estados": meta.get("metodo_por_pregunta", []),
-            "etiquetas_confiables": ESTADOS_CONFIABLES_HIBRIDO,
-            "tiempo_s": elapsed, "llamadas_api": n_llamadas,
+            "etiquetas_confiables": ESTADOS_CONFIABLES_HIBRIDO, "etiquetas_media": ESTADOS_MEDIA_HIBRIDO,
+            "tiempo_s": elapsed, "llamadas_api": n_id + n_arb,
+            "n_api_calls_identification": n_id, "n_api_calls_answer_arbitration": n_arb,
+            "n_answers_omr": meta.get("n_answers_omr", 0), "n_answers_ai": meta.get("n_answers_ai", 0),
+            "n_answers_manual": meta.get("n_answers_manual", 0),
+            "n_answers_unresolved": meta.get("n_answers_unresolved", 0),
             "pct_resuelto_sin_ia": meta.get("n_confiable", 0) / n if n and meta.get("usado") else 0.0,
             "geometry_confidence_por_banda": meta.get("geometry_confidence_por_banda", []),
-            "n_geometry_error": meta.get("n_geometry_error", 0)}
+            "n_geometry_error": meta.get("n_geometry_error", 0),
+            "n_geometry_warning": meta.get("n_geometry_warning", 0)}
 
 
 def _cargar_app_module():
@@ -237,8 +302,12 @@ def main():
             except Exception as e:
                 print(f"[{metodo}] {caso['imagen']}: ERROR {e}", file=sys.stderr)
                 continue
-            ev = evaluar_respuestas(salida["respuestas"], real, salida.get("estados"), salida.get("etiquetas_confiables"))
+            ev = evaluar_respuestas(salida["respuestas"], real, salida.get("estados"),
+                                     salida.get("etiquetas_confiables"), salida.get("etiquetas_media"))
             ev["n_geometry_error"] = salida.get("n_geometry_error", 0)
+            ev["n_geometry_warning"] = salida.get("n_geometry_warning", 0)
+            ev["n_api_calls_identification"] = salida.get("n_api_calls_identification", 0)
+            ev["n_api_calls_answer_arbitration"] = salida.get("n_api_calls_answer_arbitration", 0)
             resultados_por_metodo[metodo].append(ev)
             tiempos[metodo].append(salida["tiempo_s"])
             llamadas[metodo].append(salida["llamadas_api"])
@@ -271,10 +340,63 @@ def main():
             print(f"HIGH-CONFIDENCE precision: {precision_ac*100:.2f}%  ({aciertos_ac}/{n_ac})  "
                   f"<- métrica principal: una respuesta 'confiable' incorrecta es la falla más grave")
             print(f"HIGH-CONFIDENCE coverage: {n_ac/n_total*100:.1f}%  ({n_ac}/{n_total} preguntas)")
+        n_med = sum(e["n_media"] for e in evs)
+        aciertos_med = sum(e["aciertos_media"] for e in evs)
+        if n_med:
+            precision_med = aciertos_med / n_med
+            print(f"MEDIUM-CONFIDENCE precision: {precision_med*100:.2f}%  ({aciertos_med}/{n_med})")
+
         n_geo_error = sum(e.get("n_geometry_error", 0) for e in evs)
-        if n_geo_error:
-            print(f"GEOMETRY_ERROR (sin evidencia de grilla real, forzadas a revisión manual): "
-                  f"{n_geo_error}/{n_total}")
+        n_geo_warning = sum(e.get("n_geometry_warning", 0) for e in evs)
+        # geometry_success_rate: fracción de preguntas cuya geometría fue
+        # demostrable (no forzada a revisión manual por falta de evidencia) --
+        # separado de accuracy: mide si el motor pudo UBICAR la grilla, no si
+        # leyó bien la marca una vez ubicada.
+        geometry_success_rate = 1 - (n_geo_error / n_total) if n_total else 0.0
+        print(f"geometry_success_rate: {geometry_success_rate*100:.2f}%  "
+              f"(GEOMETRY_ERROR: {n_geo_error}/{n_total}, GEOMETRY_WARNING: {n_geo_warning}/{n_total})")
+
+        # blank precision/recall: de lo que el método dijo "en blanco", cuánto
+        # realmente lo estaba (precision); de lo que realmente estaba en
+        # blanco, cuánto se detectó como tal (recall).
+        pred_blank = sum(e["pred_blank"] for e in evs)
+        real_blank = sum(e["real_blank"] for e in evs)
+        blank_correcto = sum(e["blank_correcto"] for e in evs)
+        if pred_blank:
+            print(f"blank_precision: {blank_correcto/pred_blank*100:.2f}%  ({blank_correcto}/{pred_blank})")
+        if real_blank:
+            print(f"blank_recall: {blank_correcto/real_blank*100:.2f}%  ({blank_correcto}/{real_blank})")
+
+        # Tasas derivadas del Counter de estados crudos -- vocabulario propio
+        # de cada método (ver METODO_TASAS).
+        estados_totales = Counter()
+        for e in evs:
+            estados_totales.update(e["estados_counter"])
+        for nombre_tasa, etiquetas in METODO_TASAS.get(metodo, {}).items():
+            count = sum(estados_totales.get(e, 0) for e in etiquetas)
+            if count:
+                print(f"{nombre_tasa}: {count/n_total*100:.2f}%  ({count}/{n_total})")
+
+        # accuracy_by_letter: de las preguntas donde el ground truth es esa
+        # letra, qué fracción el método acertó -- deja ver si el error se
+        # concentra en una alternativa puntual (p.ej. una columna corrida).
+        partes_letra = []
+        for letra in LETRAS_CM[:5]:
+            total_letra = sum(cm[letra][p] for p in LETRAS_CM)
+            if total_letra:
+                partes_letra.append(f"{letra}={cm[letra][letra]/total_letra*100:.0f}%({cm[letra][letra]}/{total_letra})")
+        if partes_letra:
+            print("accuracy_by_letter: " + "  ".join(partes_letra))
+
+        # Costo real de API: identificación y arbitraje de dudosas por separado
+        # -- antes se contaban como una sola llamada indistinta (bug real, ver
+        # correr_metodo_hibrido), lo que subestimaba el costo de hojas con
+        # preguntas ambiguas.
+        n_id = sum(e.get("n_api_calls_identification", 0) for e in evs)
+        n_arb = sum(e.get("n_api_calls_answer_arbitration", 0) for e in evs)
+        if n_id or n_arb:
+            print(f"n_api_calls_identification: {n_id}  |  n_api_calls_answer_arbitration: {n_arb}")
+
         print(f"Tiempo promedio por imagen: {sum(tiempos[metodo])/len(tiempos[metodo])*1000:.0f} ms")
         print(f"Llamadas a Claude promedio por imagen: {sum(llamadas[metodo])/len(llamadas[metodo]):.2f}")
         print(f"% resuelto sin llamar a IA: {sum(pct_sin_ia[metodo])/len(pct_sin_ia[metodo])*100:.1f}%")
