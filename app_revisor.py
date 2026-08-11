@@ -10,6 +10,7 @@ import io
 import json
 import re
 import base64
+import hashlib
 import qrcode
 import pandas as pd
 import streamlit as st
@@ -81,7 +82,7 @@ for k, v in {
     "correcciones": {},      # {arch: {str(num_p): letra}}
     "info_edits": {},        # {arch: {campo: valor}}
     "pauta": [],
-    "procesados": set(),
+    "fotos_pendientes": {},  # {id_unico: {nombre, bytes, mime, hash}} — subidas sin procesar aún
     "pauta_df": df_pauta_vacio(80),
 }.items():
     if k not in st.session_state:
@@ -128,20 +129,15 @@ def tiene_secret() -> bool:
     except Exception:
         return False
 
-def imagen_a_base64(f):
-    tipos = {"image/jpeg":"image/jpeg","image/jpg":"image/jpeg",
-             "image/png":"image/png","image/webp":"image/webp","image/heic":"image/jpeg"}
-    mt = tipos.get(f.type, "image/jpeg")
-    data = base64.standard_b64encode(f.read()).decode()
-    f.seek(0)
-    return data, mt
+TIPOS_MIME = {"image/jpeg":"image/jpeg","image/jpg":"image/jpeg",
+              "image/png":"image/png","image/webp":"image/webp","image/heic":"image/jpeg"}
 
-def procesar_imagen(cliente, f, n: int) -> dict:
-    data, mt = imagen_a_base64(f)
+def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
+    data = base64.standard_b64encode(datos_bytes).decode()
     msg = cliente.messages.create(
         model="claude-sonnet-5", max_tokens=2048,
         messages=[{"role":"user","content":[
-            {"type":"image","source":{"type":"base64","media_type":mt,"data":data}},
+            {"type":"image","source":{"type":"base64","media_type":mime,"data":data}},
             {"type":"text","text":prompt_dinamico(n)},
         ]}],
     )
@@ -150,7 +146,7 @@ def procesar_imagen(cliente, f, n: int) -> dict:
     if m:
         texto = m.group(0)
     res = json.loads(texto)
-    res["archivo"] = f.name
+    res["archivo"] = nombre
     res["n_preguntas"] = n
     resp = res.get("respuestas", [])
     res["respuestas"] = (resp + [None]*n)[:n]
@@ -354,7 +350,7 @@ with st.sidebar:
         nn = st.session_state["n_preguntas"]
         st.session_state.update({
             "resultados":{}, "correcciones":{}, "info_edits":{},
-            "procesados":set(), "pauta":[], "pauta_df":df_pauta_vacio(nn),
+            "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
         })
         st.rerun()
 
@@ -458,36 +454,69 @@ with tab_cargar:
 
     st.markdown("---")
     st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
+    st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
+               "cada una queda guardada aunque la cámara se abra de nuevo.")
     archivos = st.file_uploader("Fotos", type=["jpg","jpeg","png","webp"],
-                                 accept_multiple_files=True, label_visibility="collapsed")
+                                 accept_multiple_files=True, label_visibility="collapsed",
+                                 key="uploader_fotos")
+
+    # Cada foto seleccionada se guarda de inmediato en session_state (por hash de
+    # contenido, no por nombre de archivo). Esto evita perder fotos anteriores cuando
+    # el celular reabre la cámara y reemplaza la selección del input, y evita
+    # colisiones cuando la cámara reutiliza el mismo nombre genérico (ej. "image.jpg").
     if archivos:
-        nuevos=[f for f in archivos if f.name not in st.session_state.procesados]
-        ya    =[f for f in archivos if f.name in st.session_state.procesados]
-        c1,c2 = st.columns(2)
-        if ya:     c1.success(f"✓ {len(ya)} ya procesadas")
-        if nuevos: c2.warning(f"⏳ {len(nuevos)} nuevas")
-        if nuevos:
-            key=api_key_activa()
-            if not key:
-                st.error("Ingresa tu API Key en el panel lateral.")
-            elif st.button(f"🚀 Procesar {len(nuevos)} hoja(s)", type="primary", use_container_width=True):
-                cliente=anthropic.Anthropic(api_key=key)
-                prog=st.progress(0,text="Iniciando...")
-                errs=[]
-                for i,f in enumerate(nuevos):
-                    prog.progress(i/len(nuevos), text=f"Procesando {f.name} ({i+1}/{len(nuevos)})...")
-                    try:
-                        res=procesar_imagen(cliente,f,n)
-                        st.session_state.resultados[f.name]=res
-                        st.session_state.procesados.add(f.name)
-                    except Exception as e:
-                        errs.append(f"{f.name}: {e}")
-                prog.progress(1.0, text="¡Completado!")
-                if errs: st.error("Errores:\n"+"\n".join(errs))
-                else: st.success(f"✅ {len(nuevos)} procesadas. Ve a **Revisar y corregir**.")
-                st.rerun()
-        elif ya:
-            st.success("✅ Todas las fotos cargadas. Ve a **Revisar y corregir**.")
+        hashes_conocidos = {v["hash"] for v in st.session_state.fotos_pendientes.values()}
+        hashes_conocidos |= {d.get("hash") for d in st.session_state.resultados.values()}
+        agregadas = 0
+        for f in archivos:
+            contenido = f.read()
+            h = hashlib.md5(contenido).hexdigest()
+            if h not in hashes_conocidos:
+                idx = len(st.session_state.fotos_pendientes) + len(st.session_state.resultados) + 1
+                st.session_state.fotos_pendientes[f"foto_{idx:03d}"] = {
+                    "nombre": f.name, "bytes": contenido,
+                    "mime": TIPOS_MIME.get(f.type, "image/jpeg"), "hash": h,
+                }
+                hashes_conocidos.add(h)
+                agregadas += 1
+        if agregadas:
+            st.rerun()
+
+    pendientes = st.session_state.fotos_pendientes
+    total_proc = len(st.session_state.resultados)
+
+    if pendientes or total_proc:
+        c1, c2 = st.columns(2)
+        if total_proc: c1.success(f"✓ {total_proc} ya procesadas")
+        if pendientes: c2.warning(f"⏳ {len(pendientes)} nuevas por procesar")
+
+    if pendientes:
+        with st.expander(f"📋 Fotos por procesar ({len(pendientes)})"):
+            for id_unico, foto in pendientes.items():
+                st.caption(f"• {foto['nombre']}")
+        key = api_key_activa()
+        if not key:
+            st.error("Ingresa tu API Key en el panel lateral.")
+        elif st.button(f"🚀 Procesar {len(pendientes)} hoja(s)", type="primary", use_container_width=True):
+            cliente = anthropic.Anthropic(api_key=key)
+            prog = st.progress(0, text="Iniciando...")
+            errs = []
+            items = list(pendientes.items())
+            for i, (id_unico, foto) in enumerate(items):
+                prog.progress(i/len(items), text=f"Procesando {foto['nombre']} ({i+1}/{len(items)})...")
+                try:
+                    res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n)
+                    res["hash"] = foto["hash"]
+                    st.session_state.resultados[id_unico] = res
+                except Exception as e:
+                    errs.append(f"{foto['nombre']}: {e}")
+                st.session_state.fotos_pendientes.pop(id_unico, None)
+            prog.progress(1.0, text="¡Completado!")
+            if errs: st.error("Errores:\n"+"\n".join(errs))
+            else: st.success(f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
+            st.rerun()
+    elif total_proc:
+        st.success("✅ Todas las fotos cargadas. Ve a **Revisar y corregir**.")
     else:
         st.markdown("""
         <div style="border:2px dashed #d1d5db;border-radius:16px;padding:2.5rem;
