@@ -27,6 +27,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+VERSION_APP = "1.5.0"
+FECHA_ACTUALIZACION = "2026-08-11"
+DESARROLLADO_POR = "Matías Rifo V."
+
 st.markdown("""
 <style>
 .corr-badge {
@@ -112,6 +116,14 @@ igual de oscura, un borrón que deja la burbuja ambigua entre dos letras, o una 
 ser intencional). Si el trazo es imperfecto o desprolijo pero al mirarlo con calma se entiende con claridad
 cuál opción eligió el estudiante, NO es una pregunta dudosa — entrégala como respuesta normal, sin marcarla.
 
+Advertencia importante sobre resolución: como hay {n} preguntas × 5 burbujas en una sola imagen, algunas filas
+pueden verse muy pequeñas o borrosas. NUNCA elijas una opción al azar solo porque "alguna" debe ser la
+respuesta — si de verdad no puedes distinguir con confianza cuál de las 5 burbujas de una fila está marcada
+(o si no puedes distinguir si hay o no una marca), es preferible responder null y agregar esa pregunta a
+"dudosas", en vez de adivinar una letra. Adivinar en silencio es el peor resultado posible: se ve como una
+respuesta correcta pero puede ser falsa. Antes de dar cualquier letra, confirma que realmente ves esa burbuja
+específica más oscura o marcada que las otras 4 de su misma fila.
+
 El objetivo es que "dudosas" quede lo más corta posible y contenga solo los casos con riesgo real de error;
 todo lo demás se da por bueno sin necesitar revisión humana.
 
@@ -153,7 +165,7 @@ def tiene_secret() -> bool:
 TIPOS_MIME = {"image/jpeg":"image/jpeg","image/jpg":"image/jpeg",
               "image/png":"image/png","image/webp":"image/webp","image/heic":"image/jpeg"}
 
-def comprimir_imagen(datos_bytes: bytes, mime: str, lado_max: int = 1600, calidad: int = 85):
+def comprimir_imagen(datos_bytes: bytes, mime: str, lado_max: int = 2200, calidad: int = 92):
     """Reduce tamaño/resolución para que la subida desde datos móviles no se cuelgue."""
     try:
         img = Image.open(io.BytesIO(datos_bytes))
@@ -402,6 +414,8 @@ with st.sidebar:
             "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
         })
         st.rerun()
+    st.caption(f"Versión {VERSION_APP} · Actualizado {FECHA_ACTUALIZACION}")
+    st.caption(f"Desarrollado por {DESARROLLADO_POR}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -420,7 +434,9 @@ tab_pauta, tab_cargar, tab_revisar, tab_exportar = st.tabs([
 # ══ PAUTA ════════════════════════════════════════════════════════════
 with tab_pauta:
     st.markdown(f"### Respuestas correctas — {n} preguntas")
-    st.caption("Haz clic en una celda de **Respuesta** y elige A–E. O usa importación rápida a la derecha.")
+    st.caption("💡 Recomendado: usa **Importar rápido** a la derecha (pega todas las respuestas de una vez) "
+               "— es más rápido y evita el parpadeo/reseteo que puede ocurrir al editar celda por celda muy "
+               "rápido en la tabla. Usa la tabla solo para corregir 1 o 2 celdas puntuales.")
     col_t, col_i = st.columns([2, 1], gap="large")
 
     with col_i:
@@ -457,7 +473,7 @@ with tab_pauta:
                     "Respuesta", options=["A","B","C","D","E"], width="small", required=False),
             },
             hide_index=True, height=min(38*n+40, 560),
-            use_container_width=True, key="editor_pauta",
+            use_container_width=True, key="editor_pauta", num_rows="fixed",
         )
         st.session_state["pauta_df"] = df_ed
         st.session_state["pauta"]    = pauta_desde_df(df_ed)
@@ -493,8 +509,11 @@ with tab_cargar:
 1. Escanea el QR o entra a la URL en el navegador del celular
 2. Toca **Cargar fotos** arriba
 3. Toca **Upload** → elige **Cámara** o **Galería**
-4. Buena iluminación, encuadra toda la hoja
-5. Sube varias antes de procesar
+4. **Acerca el celular a la hoja** hasta que ocupe todo el encuadre (sin mesa, ropa
+   ni pies alrededor) — con 80 preguntas cada burbuja es diminuta, así que entre
+   más grande se vea la hoja en la foto, más fácil es distinguir cuál está marcada
+5. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
+6. Sube varias antes de procesar
 """)
     else:
         st.info("Desde el celular: entra a la URL de esta app en el navegador. "
@@ -505,6 +524,10 @@ with tab_cargar:
     st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
     st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
                "cada una queda guardada aunque la cámara se abra de nuevo.")
+    st.caption("📸 **Clave para que la IA lea bien:** acerca la cámara y llena el encuadre con la hoja "
+               "(sin fondo alrededor), foto derecha y con buena luz. Con 80 preguntas × 5 burbujas en una "
+               "sola foto, cada burbuja es muy pequeña — mientras más cerca y nítida la tomes, mejor detecta "
+               "cuál está marcada.")
     st.caption("💡 Recomendado: procesa de a **15–20 fotos por lote** (no 40–80 de una vez). "
                "Así el progreso no se pierde si el celular se bloquea o hay corte de conexión, "
                "y luego puedes exportar cada lote y unirlos en un Excel maestro.")
