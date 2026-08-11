@@ -142,10 +142,11 @@ def _cargar_app_module():
 
     bloque_omr = src[src.index("OMR_THRESHOLDS = {"):src.index("# ═══════════════════════ fin motor OMR")]
 
-    nombres = ["prompt_dinamico", "prompt_identificacion",
+    nombres = ["prompt_dinamico", "prompt_identificacion", "prompt_revision_dudosas",
                "abrir_imagen_corregida", "preparar_imagenes", "mejorar_contraste_burbujas",
                "_img_a_b64_jpeg", "evaluar_sospecha", "_llamar_claude", "procesar_imagen",
-               "_bgr_a_jpeg_b64", "llamar_claude_identificacion", "_crop_dudosa_b64_jpeg",
+               "_bgr_a_jpeg_b64", "llamar_claude_identificacion", "llamar_claude_revision_dudosas",
+               "_crop_dudosa_b64_jpeg",
                "analizar_hoja_omr", "_fallback_no_leido", "_construir_resultado_omr",
                "procesar_imagen_hibrido"]
     import io, base64, hashlib, json as _json
