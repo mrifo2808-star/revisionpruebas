@@ -72,21 +72,19 @@ def prompt_dinamico(n: int) -> str:
     return f"""Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
 
 Examina la imagen con atención, pregunta por pregunta, en orden desde la P1 hasta la P{n}. No saltes ninguna.
+Para cada una, determina qué opción (A-E) marcó el estudiante, o null si no hay ninguna marca.
 
-Para cada pregunta:
-1. Ubica la fila o casillero correspondiente a ese número.
-2. Revisa las opciones A, B, C, D, E de esa fila.
-3. Cuenta como "marcada" cualquier opción rellena, sombreada, con una X, un check o cualquier trazo de lápiz
-   claramente dentro o sobre la burbuja — no solo círculos perfectamente rellenos a mano.
-4. Si ninguna opción tiene marca alguna, la respuesta es null (omitida).
-5. Si hay más de una opción marcada, elige como respuesta la que se vea más marcada/oscura, y agrega esa
-   pregunta a "dudosas" para que una persona la confirme después.
-6. Si la marca es tenue, está parcialmente borrada, tachada y vuelta a marcar, fuera de la burbuja o de
-   cualquier forma ambigua: igual entrega tu mejor estimación en "respuestas", pero agrega el número de esa
-   pregunta a "dudosas" en vez de asumir que estás en lo correcto.
-7. Ante cualquier duda razonable sobre una pregunta, prefiere marcarla como dudosa antes que arriesgar una
-   lectura incorrecta silenciosa — el paso siguiente del proceso es justamente para que una persona valide
-   esas preguntas puntuales, no las {n} completas.
+Antes de responder, vuelve a mirar por segunda vez SOLO las preguntas donde no quedaste 100% seguro de cuál
+opción marcó el estudiante, y confírmalas con calma.
+
+Criterio simple para "dudosas" — marca una pregunta como dudosa ÚNICAMENTE si, tras esa segunda mirada, sigue
+existiendo un riesgo real de haber leído mal la intención del estudiante (ejemplos: dos opciones con marca
+igual de oscura, un borrón que deja la burbuja ambigua entre dos letras, o una marca tan tenue que pudo no
+ser intencional). Si el trazo es imperfecto o desprolijo pero al mirarlo con calma se entiende con claridad
+cuál opción eligió el estudiante, NO es una pregunta dudosa — entrégala como respuesta normal, sin marcarla.
+
+El objetivo es que "dudosas" quede lo más corta posible y contenga solo los casos con riesgo real de error;
+todo lo demás se da por bueno sin necesitar revisión humana.
 
 Responde ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown, con esta forma exacta:
 
@@ -103,7 +101,7 @@ Responde ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown, con e
 Reglas de formato:
 - "respuestas": exactamente {n} elementos, en el mismo orden P1..P{n}. Usa null solo si la pregunta está
   realmente omitida (ninguna marca visible), no como comodín para lo que no estés seguro.
-- "dudosas": números de pregunta (1 a {n}) que necesitan revisión humana según los puntos 5 y 6.
+- "dudosas": números de pregunta (1 a {n}) con riesgo real de error, según el criterio simple de arriba.
 - Campos de texto ilegibles o no visibles en la hoja: cadena vacía "".
 - Solo el JSON, sin explicación ni comentarios adicionales."""
 
