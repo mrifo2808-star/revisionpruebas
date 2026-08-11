@@ -72,7 +72,7 @@ for k, v in {
 OPCIONES = ["A", "B", "C", "D", "E", "—"]
 
 
-def prompt_dinamico(n: int) -> str:
+def prompt_dinamico(n: int, num_imagenes: int = 1) -> str:
     num_columnas = -(-n // 20)  # división hacia arriba: esta plantilla usa columnas de 20 preguntas
     rangos = []
     for c in range(num_columnas):
@@ -81,7 +81,21 @@ def prompt_dinamico(n: int) -> str:
         rangos.append(f"columna {c+1} = preguntas {ini} a {fin}")
     descripcion_columnas = "; ".join(rangos)
 
-    return f"""Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
+    if num_imagenes >= 3:
+        nota_imagenes = """IMPORTANTE — te adjunto 3 fotos de la MISMA hoja de respuestas, en este orden:
+1. La hoja completa (úsala para identificar al estudiante: apellidos, nombres, cédula, folleto).
+2. Un acercamiento en zoom de la MITAD IZQUIERDA de esa misma hoja.
+3. Un acercamiento en zoom de la MITAD DERECHA de esa misma hoja (con algo de superposición con la anterior).
+
+Para leer el bloque RESPUESTAS, usa SIEMPRE los acercamientos (imágenes 2 y 3), NUNCA la foto completa — en
+los acercamientos cada burbuja se ve mucho más grande y es mucho más fácil distinguir cuál está marcada. La
+foto completa (imagen 1) es solo de referencia general y para los datos de identificación del estudiante.
+
+"""
+    else:
+        nota_imagenes = ""
+
+    return f"""{nota_imagenes}Eres un asistente experto en corregir hojas de respuestas de alternativas de estudiantes chilenos.
 Todas las hojas que vas a revisar usan siempre la misma plantilla fija "PLANTILLA DE HOJA DE RESPUESTAS", con
 esta estructura exacta:
 
@@ -165,27 +179,51 @@ def tiene_secret() -> bool:
 TIPOS_MIME = {"image/jpeg":"image/jpeg","image/jpg":"image/jpeg",
               "image/png":"image/png","image/webp":"image/webp","image/heic":"image/jpeg"}
 
-def comprimir_imagen(datos_bytes: bytes, mime: str, lado_max: int = 2200, calidad: int = 92):
-    """Reduce tamaño/resolución para que la subida desde datos móviles no se cuelgue."""
+def _img_a_b64_jpeg(img: Image.Image, lado_max: int, calidad: int) -> str:
+    img = img.convert("RGB")
+    if max(img.size) > lado_max:
+        escala = lado_max / max(img.size)
+        img = img.resize((max(1,int(img.width*escala)), max(1,int(img.height*escala))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=calidad, optimize=True)
+    return base64.standard_b64encode(buf.getvalue()).decode()
+
+def preparar_imagenes(datos_bytes: bytes, mime: str):
+    """
+    Claude redimensiona internamente cualquier imagen a un techo fijo de resolución
+    antes de analizarla. Si las 80 preguntas van en una sola foto, ese techo se
+    reparte entre las 80 y cada burbuja queda en unos pocos píxeles — insuficiente
+    para distinguir con fiabilidad el rayado a lápiz. Por eso se generan 3 versiones
+    de la misma foto: completa (para identificación del alumno) y dos acercamientos
+    —mitad izquierda / mitad derecha, con superposición— que le dan a cada mitad del
+    bloque RESPUESTAS su propio techo de resolución completo.
+    """
     try:
         img = Image.open(io.BytesIO(datos_bytes))
         img = img.convert("RGB")
-        if max(img.size) > lado_max:
-            escala = lado_max / max(img.size)
-            img = img.resize((int(img.width*escala), int(img.height*escala)), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=calidad, optimize=True)
-        return buf.getvalue(), "image/jpeg"
     except Exception:
-        return datos_bytes, mime
+        return [(base64.standard_b64encode(datos_bytes).decode(), mime)]
+    w, h = img.size
+    completa = _img_a_b64_jpeg(img, 1568, 90)
+    margen = 0.08  # superposición para no cortar una columna justo por la mitad
+    izq = img.crop((0, 0, int(w * (0.5 + margen)), h))
+    der = img.crop((int(w * (0.5 - margen)), 0, w, h))
+    return [
+        (completa, "image/jpeg"),
+        (_img_a_b64_jpeg(izq, 1568, 90), "image/jpeg"),
+        (_img_a_b64_jpeg(der, 1568, 90), "image/jpeg"),
+    ]
 
 def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int) -> dict:
-    data = base64.standard_b64encode(datos_bytes).decode()
+    imagenes = preparar_imagenes(datos_bytes, mime)
+    bloques_imagen = [
+        {"type":"image","source":{"type":"base64","media_type":mt,"data":data}}
+        for data, mt in imagenes
+    ]
     msg = cliente.messages.create(
         model="claude-sonnet-5", max_tokens=4096,
-        messages=[{"role":"user","content":[
-            {"type":"image","source":{"type":"base64","media_type":mime,"data":data}},
-            {"type":"text","text":prompt_dinamico(n)},
+        messages=[{"role":"user","content": bloques_imagen + [
+            {"type":"text","text":prompt_dinamico(n, len(imagenes))},
         ]}],
     )
     if msg.stop_reason == "max_tokens":
@@ -547,11 +585,13 @@ with tab_cargar:
             contenido = f.read()
             h = hashlib.md5(contenido).hexdigest()
             if h not in hashes_conocidos:
-                comprimido, mime_final = comprimir_imagen(contenido, TIPOS_MIME.get(f.type, "image/jpeg"))
+                # Se guarda tal cual (sin comprimir aquí): el recorte en mitades y la
+                # compresión ocurren recién al procesar, a partir de la resolución
+                # original, para maximizar el detalle de cada acercamiento.
                 idx = len(st.session_state.fotos_pendientes) + len(st.session_state.resultados) + 1
                 st.session_state.fotos_pendientes[f"foto_{idx:03d}"] = {
-                    "nombre": f.name, "bytes": comprimido,
-                    "mime": mime_final, "hash": h,
+                    "nombre": f.name, "bytes": contenido,
+                    "mime": TIPOS_MIME.get(f.type, "image/jpeg"), "hash": h,
                 }
                 hashes_conocidos.add(h)
                 agregadas += 1
