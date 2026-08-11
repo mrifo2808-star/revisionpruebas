@@ -21,6 +21,17 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# Motor OMR (opcional): si opencv/numpy no están disponibles en el entorno de
+# despliegue, la app sigue funcionando 100% igual que antes con el flujo solo-IA
+# — el modo OMR simplemente no aparece como opción en el sidebar.
+try:
+    import numpy as np
+    import cv2
+    import omr
+    OMR_DISPONIBLE = True
+except Exception:
+    OMR_DISPONIBLE = False
+
 st.set_page_config(
     page_title="Revisor de Pruebas",
     page_icon="📝",
@@ -28,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "1.7.0"
+VERSION_APP = "2.0.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -67,6 +78,7 @@ for k, v in {
     "fotos_pendientes": {},  # {id_unico: {nombre, bytes, mime, hash}} — subidas sin procesar aún
     "pauta_df": df_pauta_vacio(80),
     "modo_captura": "completa",  # "completa" | "solo_respuestas"
+    "usar_omr": False,           # motor OMR + IA solo para dudas (beta)
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -205,6 +217,53 @@ Responde ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown, con e
 {reglas_formato}"""
 
 
+def prompt_identificacion() -> str:
+    """Prompt acotado para el motor OMR: la IA NO lee burbujas de respuestas aquí
+    (eso ya lo resolvió el OMR), solo transcribe los datos manuscritos/marcados
+    de la cabecera de la hoja — más barato y sin riesgo de confundir tareas."""
+    return """Estás viendo la cabecera de una "PLANTILLA DE HOJA DE RESPUESTAS" chilena (no el
+bloque de respuestas). Contiene:
+- "IDENTIFICACIÓN DEL ESTUDIANTE": Apellido Paterno, Apellido Materno y Nombres, escritos A
+  MANO, una letra por casillero.
+- "CÉDULA DE IDENTIDAD": dígitos que pueden venir escritos a mano y/o marcados con burbujas
+  (una columna de burbujas 0-9 por cada dígito). Usa el texto a mano si es legible; si no,
+  completa leyendo qué burbuja está marcada en cada columna. Ignora "PASAPORTE" si está vacío.
+- Casilleros de "N° DE FOLLETO", "SEDE", "LOCAL" y "SALA" — a menudo vacíos.
+
+Responde ÚNICAMENTE un JSON válido, sin texto adicional:
+{"apellido_paterno":"...","apellido_materno":"...","nombres":"...","cedula":"...","nro_folleto":"..."}
+
+Campos ilegibles o no visibles: cadena vacía "". Solo el JSON."""
+
+
+def prompt_revision_ambiguas(preguntas: list) -> str:
+    """
+    Prompt para la segunda revisión focalizada: NO es el prompt completo de 80
+    preguntas, es deliberadamente acotado a "cuál burbuja está marcada en este
+    recorte puntual" — el motor OMR ya resolvió el resto de la hoja y solo pide
+    ayuda en las filas donde no pudo decidir con confianza (marca débil, dos
+    alternativas muy parecidas, o mancha que se corre hacia una burbuja vecina).
+    """
+    lista = ", ".join(f"P{p}" for p in preguntas)
+    return f"""Te adjunto {len(preguntas)} recortes de una hoja de respuestas de alternativas
+(A/B/C/D/E). Cada recorte muestra UNA fila: su número de pregunta impreso a la izquierda y
+sus 5 burbujas A-E. Te los muestro en este orden: {lista}.
+
+Un sistema automático de reconocimiento óptico ya leyó el resto de la hoja y solo tiene dudas
+en estas filas puntuales (marca débil, dos alternativas con relleno parecido, o una mancha de
+lápiz que se corre hacia la burbuja vecina). Tu única tarea es decidir, para cada recorte,
+cuál de las 5 burbujas tiene la marca de lápiz — NO intentes resolver ni evaluar la pregunta.
+
+Para cada recorte, compara las 5 burbujas ENTRE SÍ y elige la que se vea más oscura/rellena
+respecto a sus vecinas de esa misma fila. Si de verdad las 5 se ven vacías, responde null. Si
+dos burbujas están igual de marcadas y es imposible distinguir cuál es la real, responde null
+también — no adivines "porque alguna debe ser".
+
+Responde ÚNICAMENTE un JSON válido con esta forma exacta, un elemento por recorte en el mismo
+orden en que te los mostré:
+{{"resultados": [{{"pregunta": N, "letra": "A"}}, {{"pregunta": N, "letra": null}}, ...]}}"""
+
+
 # ─── Funciones de datos ──────────────────────────────────────────────
 
 def api_key_activa() -> str:
@@ -243,6 +302,26 @@ def mejorar_contraste_burbujas(img: Image.Image) -> Image.Image:
     img_contraste = ImageEnhance.Contrast(img_gris).enhance(1.8)
     return ImageEnhance.Sharpness(img_contraste).enhance(2.0)
 
+def abrir_imagen_corregida(datos_bytes: bytes):
+    """
+    Abre la imagen a su resolución ORIGINAL (sin redimensionar ni comprimir) y
+    corrige la orientación EXIF: las fotos de celular suelen traer el tag EXIF
+    "Orientation" en vez de venir realmente rotadas en los píxeles, y sin
+    corregir esto la imagen puede llegar "acostada" 90°/180° aunque se vea
+    derecha en el celular, desalineando cualquier recorte/detección posterior.
+    Esto NO cubre fotos que ya vienen genuinamente rotadas en los píxeles (sin
+    metadato EXIF, p.ej. tras pasar por WhatsApp o un editor que lo eliminó) —
+    para esas, la corrección tiene que hacerla quien toma/recorta la foto.
+    Devuelve None si la imagen no se puede decodificar.
+    """
+    try:
+        img = Image.open(io.BytesIO(datos_bytes))
+        img = ImageOps.exif_transpose(img)
+        return img.convert("RGB")
+    except Exception:
+        return None
+
+
 def preparar_imagenes(datos_bytes: bytes, mime: str, solo_respuestas: bool = False):
     """
     Claude redimensiona internamente cualquier imagen a un techo fijo de resolución
@@ -254,19 +333,8 @@ def preparar_imagenes(datos_bytes: bytes, mime: str, solo_respuestas: bool = Fal
     "solo_respuestas") — cada mitad le da a su franja del bloque RESPUESTAS su propio
     techo de resolución completo en vez de compartirlo con el resto de la hoja.
     """
-    try:
-        img = Image.open(io.BytesIO(datos_bytes))
-        # Las fotos de celular suelen traer el tag EXIF "Orientation" en vez de venir
-        # realmente rotadas en los píxeles: sin corregir esto, la imagen puede llegar
-        # "acostada" 90°/180° a la API aunque se vea derecha en el celular, lo que
-        # desalinea por completo el recorte de cabecera/mitades de más abajo y produce
-        # lecturas erráticas de todo el bloque de respuestas. Esto NO cubre fotos que
-        # ya vienen genuinamente rotadas en los píxeles (sin metadato EXIF, p.ej. tras
-        # pasar por WhatsApp o un editor que lo eliminó) — para esas, la corrección
-        # tiene que hacerla quien toma/recorta la foto antes de subirla.
-        img = ImageOps.exif_transpose(img)
-        img = img.convert("RGB")
-    except Exception:
+    img = abrir_imagen_corregida(datos_bytes)
+    if img is None:
         return [(base64.standard_b64encode(datos_bytes).decode(), mime)]
     w, h = img.size
     margen = 0.10  # superposición horizontal para no cortar una columna justo por la mitad
@@ -386,6 +454,233 @@ def procesar_imagen(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
     res["intentos"] = intentos
     res["solo_respuestas"] = solo_respuestas
     return res
+
+
+# ─── Motor OMR + IA solo para dudas (beta) ────────────────────────────
+# Pipeline paralelo al 100%-IA de arriba (que se deja intacto como respaldo
+# garantizado): en vez de pedirle a Claude que lea las 400 burbujas de la hoja,
+# un motor de visión clásica (ver omr.py) mide directamente cuánto más oscura
+# está cada burbuja que el papel en blanco, comparando siempre dentro de la
+# misma fila. Solo las preguntas donde ese análisis no llega a una conclusión
+# confiable (marca débil, dos alternativas parecidas, mancha corrida) se
+# recortan y se mandan a Claude para una segunda mirada puntual — el resto se
+# resuelve sin llamar a la API. Si CUALQUIER etapa de este pipeline falla
+# (imagen no decodificable, tabla no localizable, etc.), se cae automáticamente
+# al flujo 100%-IA de siempre.
+
+def _bgr_a_jpeg_b64(img_bgr, calidad: int = 95, lado_max: int = None):
+    if lado_max and max(img_bgr.shape[:2]) > lado_max:
+        escala = lado_max / max(img_bgr.shape[:2])
+        img_bgr = cv2.resize(img_bgr, (max(1, int(img_bgr.shape[1]*escala)), max(1, int(img_bgr.shape[0]*escala))),
+                              interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, calidad])
+    if not ok:
+        raise omr.OMRError("No se pudo codificar un recorte OMR como JPEG.")
+    return base64.standard_b64encode(buf.tobytes()).decode()
+
+
+def llamar_claude_identificacion(cliente, header_bgr) -> dict:
+    """Segunda llamada, pequeña y acotada: solo transcribe la cabecera (nombre/RUT/folleto),
+    nunca lee burbujas de respuestas — eso ya lo resolvió el motor OMR."""
+    data = _bgr_a_jpeg_b64(header_bgr, calidad=90, lado_max=1024)
+    msg = cliente.messages.create(
+        model="claude-sonnet-5", max_tokens=512,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
+            {"type": "text", "text": prompt_identificacion()},
+        ]}],
+    )
+    texto = next((b.text for b in msg.content if b.type == "text"), None)
+    if texto is None:
+        return {}
+    m = re.search(r'\{[\s\S]*\}', texto.strip())
+    try:
+        return json.loads(m.group(0) if m else texto)
+    except Exception:
+        return {}
+
+
+def llamar_claude_revision_ambiguas(cliente, crops: list) -> dict:
+    """crops: lista de (numero_pregunta, imagen_bgr). Devuelve {numero_pregunta: letra_o_None}.
+    Preguntas que la IA no devuelva explícitamente quedan como None (no se adivina)."""
+    if not crops:
+        return {}
+    preguntas = [q for q, _ in crops]
+    bloques = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                      "data": _bgr_a_jpeg_b64(c, calidad=95)}}
+        for _, c in crops
+    ]
+    msg = cliente.messages.create(
+        model="claude-sonnet-5", max_tokens=1024,
+        messages=[{"role": "user", "content": bloques + [
+            {"type": "text", "text": prompt_revision_ambiguas(preguntas)},
+        ]}],
+    )
+    texto = next((b.text for b in msg.content if b.type == "text"), None)
+    resultado = {q: None for q in preguntas}
+    if texto is None:
+        return resultado
+    m = re.search(r'\{[\s\S]*\}', texto.strip())
+    try:
+        data = json.loads(m.group(0) if m else texto)
+        for item in data.get("resultados", []):
+            q = item.get("pregunta")
+            letra = item.get("letra")
+            if q in resultado:
+                resultado[q] = letra.upper() if isinstance(letra, str) and letra.upper() in LETRAS_VALIDAS else None
+    except Exception:
+        pass
+    return resultado
+
+
+def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict:
+    """
+    Corre el motor OMR puro (sin llamadas a la API) sobre la imagen a resolución
+    original. Devuelve la salida cruda de omr.analizar_imagen truncada/rellenada
+    a n preguntas, más la imagen (BGR, sin comprimir) por si hace falta recortar
+    preguntas puntuales para la IA. Lanza omr.OMRError si no logra ubicar una
+    grilla legible (la llamante debe caer al flujo 100%-IA en ese caso).
+    """
+    img_pil = abrir_imagen_corregida(datos_bytes)
+    if img_pil is None:
+        raise omr.OMRError("La imagen no se pudo decodificar.")
+    img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    salida = omr.analizar_imagen(img_bgr, es_recorte=solo_respuestas)
+    resultados = salida["resultados"]
+    n_disponibles = len(resultados)
+    if n_disponibles < n:
+        # la hoja/recorte tiene menos filas detectadas que preguntas configuradas
+        resultados = resultados + [{"letra": None, "status": "sin_marca", "omr_confidence": 0.0}] * (n - n_disponibles)
+    salida["resultados"] = resultados[:n]
+    salida["img_bgr_original"] = img_bgr
+    salida["quad_respuestas"] = None if solo_respuestas else omr.detectar_bloque_respuestas(img_bgr)
+    return salida
+
+
+def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
+                             solo_respuestas: bool = False) -> dict:
+    try:
+        salida = analizar_hoja_omr(datos_bytes, solo_respuestas, n)
+    except Exception as e:
+        # Cualquier fallo del pipeline OMR (tabla no localizable, imagen ilegible,
+        # etc.) cae directo al flujo 100%-IA de siempre: nunca se pierde una hoja
+        # por un problema del motor OMR.
+        res = procesar_imagen(cliente, nombre, datos_bytes, mime, n, solo_respuestas)
+        res["omr_meta"] = {"usado": False, "motivo_fallback": str(e)}
+        return res
+
+    resultados = salida["resultados"]
+    body_bgr = salida["body_bgr"]
+    y_centers, band_x_centers, radio = salida["y_centers"], salida["band_x_centers"], salida["radio"]
+    umbral_blanco = omr.THRESHOLDS["BLANK_REVIEW_MARGIN"]
+
+    def necesita_ia(r):
+        if r["status"] in ("ambiguo", "doble_marca", "confianza_media"):
+            return True
+        if r["status"] == "sin_marca" and r["omr_confidence"] > umbral_blanco:
+            return True
+        return False
+
+    indices_ia = [i for i, r in enumerate(resultados) if necesita_ia(r)]
+    crops_ia = [(i + 1, omr.recortar_pregunta(body_bgr, y_centers, band_x_centers, radio, i, salida["n_bandas"]))
+                for i in indices_ia]
+
+    ia_resultados = {}
+    if crops_ia:
+        try:
+            ia_resultados = llamar_claude_revision_ambiguas(cliente, crops_ia)
+        except Exception:
+            ia_resultados = {}  # la IA de revisión falló: esas preguntas quedan como dudosas para corrección manual
+
+    respuestas, dudosas, metodo_por_pregunta, confianza_por_pregunta = [], [], [], []
+    for i, r in enumerate(resultados):
+        q = i + 1
+        estado_final = r["status"]
+        letra_final = r["letra"]
+        metodo = "omr"
+        if i in indices_ia:
+            letra_ia = ia_resultados.get(q)
+            if r["letra"] is None:
+                # el OMR no tenía candidato: se confía en la IA si dio una respuesta
+                letra_final = letra_ia
+                metodo = "ia" if letra_ia else "sin_resolver"
+                if letra_ia is None:
+                    dudosas.append(q)
+            else:
+                # el OMR SÍ tenía un candidato de confianza media: si la IA coincide,
+                # se confirma; si discrepa, es un conflicto real y no se adivina.
+                if letra_ia and letra_ia != r["letra"]:
+                    letra_final = None
+                    metodo = "conflicto"
+                    dudosas.append(q)
+                elif letra_ia == r["letra"]:
+                    metodo = "omr_confirmado_ia"
+                else:  # la IA no logró determinar nada tampoco
+                    metodo = "omr_no_confirmado"
+                    dudosas.append(q)
+            estado_final = metodo
+        elif estado_final in ("ambiguo", "doble_marca"):
+            dudosas.append(q)  # por si necesita_ia() no las capturó (crops_ia vacío por error de llamada)
+        respuestas.append(letra_final)
+        metodo_por_pregunta.append(metodo)
+        confianza_por_pregunta.append(r.get("omr_confidence", 0.0))
+
+    res = {
+        "respuestas": respuestas,
+        "dudosas": sorted(set(dudosas)),
+        "archivo": nombre,
+        "n_preguntas": n,
+        "solo_respuestas": solo_respuestas,
+        "apellido_paterno": "", "apellido_materno": "", "nombres": "", "cedula": "", "nro_folleto": "",
+        "omr_meta": {
+            "usado": True,
+            "n_bandas": salida["n_bandas"],
+            "metodo_por_pregunta": metodo_por_pregunta,
+            "confianza_por_pregunta": confianza_por_pregunta,
+            "n_omr_directo": sum(1 for m in metodo_por_pregunta if m in ("omr", "omr_confirmado_ia")),
+            "n_enviadas_ia": len(crops_ia),
+            "n_conflictos": sum(1 for m in metodo_por_pregunta if m == "conflicto"),
+        },
+    }
+
+    # Datos del alumno: solo si la imagen es la hoja completa (en modo
+    # solo_respuestas no hay cabecera que leer, igual que en el flujo 100%-IA).
+    if not solo_respuestas:
+        quad = salida.get("quad_respuestas")
+        img_bgr = salida["img_bgr_original"]
+        top_tabla = int(min(p[1] for p in quad)) if quad is not None else int(img_bgr.shape[0] * 0.5)
+        header_bgr = img_bgr[0:max(1, top_tabla), :]
+        try:
+            datos_id = llamar_claude_identificacion(cliente, header_bgr)
+            for campo in ("apellido_paterno", "apellido_materno", "nombres", "cedula", "nro_folleto"):
+                res[campo] = datos_id.get(campo, "") or ""
+        except Exception:
+            pass  # el alumno queda sin identificar automáticamente; se completa a mano, igual que hoy
+
+    # Diagnóstico visual: útil para depurar/confiar en el motor OMR sin tener que
+    # revisar pregunta por pregunta.
+    resultados_diag = []
+    for i, r in enumerate(resultados):
+        rd = dict(r)
+        rd["letra"] = respuestas[i]
+        rd["status"] = metodo_por_pregunta[i]
+        resultados_diag.append(rd)
+    diag_bgr = omr.anotar_diagnostico(body_bgr, y_centers, band_x_centers, radio, resultados_diag)
+    ok, buf = cv2.imencode(".jpg", diag_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    res["omr_diagnostico_bytes"] = buf.tobytes() if ok else None
+
+    evaluar_sospecha(res)
+    # Último respaldo: si a pesar de OMR + revisión IA el resultado final sigue
+    # viéndose estadísticamente inverosímil, se descarta todo y se usa el flujo
+    # 100%-IA completo (con su propio reintento) como red de seguridad final.
+    if res["sospechoso"]:
+        res_ia = procesar_imagen(cliente, nombre, datos_bytes, mime, n, solo_respuestas)
+        if not res_ia.get("sospechoso"):
+            res_ia["omr_meta"] = {**res["omr_meta"], "usado": True, "descartado_por_sospechoso": True}
+            return res_ia
+    return res
+
 
 def datos_efectivos(arch: str) -> dict:
     """Datos originales del alumno + ediciones manuales."""
@@ -618,6 +913,28 @@ with st.sidebar:
     else:
         st.caption("📄 Sube la foto de la hoja completa; la app recorta e identifica al alumno automáticamente.")
     st.markdown("---")
+    st.markdown("**Motor de lectura**")
+    if not OMR_DISPONIBLE:
+        st.caption("🤖 Solo IA (motor OMR no disponible en este entorno).")
+    else:
+        omr_prev = st.session_state["usar_omr"]
+        omr_nuevo = st.toggle(
+            "🔬 Motor OMR + IA solo para dudas (beta)",
+            value=omr_prev, disabled=hay_procesadas,
+            help="Mide directamente qué tan oscura está cada burbuja (visión clásica, sin llamar a la "
+                 "API) y solo manda a Claude las preguntas donde no queda claro cuál está marcada. Más "
+                 "rápido y barato; si en algún punto falla, cae automáticamente al modo 100% IA de siempre.",
+        )
+        if hay_procesadas:
+            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este motor. Usa **Limpiar todo** antes de cambiarlo.")
+        elif omr_nuevo != omr_prev:
+            st.session_state["usar_omr"] = omr_nuevo
+            st.rerun()
+        if st.session_state["usar_omr"]:
+            st.caption("🔬 La mayoría de las preguntas se resuelven por análisis directo de imagen; solo "
+                       "las dudosas se envían a Claude. Revisa el diagnóstico OMR de cada hoja en "
+                       "**Revisar y corregir** antes de confiar en el resultado mientras está en beta.")
+    st.markdown("---")
     if st.button("🗑️ Limpiar todo", use_container_width=True):
         nn = st.session_state["n_preguntas"]
         st.session_state.update({
@@ -819,8 +1136,13 @@ with tab_cargar:
             for i, (id_unico, foto) in enumerate(items):
                 prog.progress(i/len(items), text=f"Procesando {foto['nombre']} ({i+1}/{len(items)})...")
                 try:
-                    res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
-                                           solo_respuestas=(modo_actual == "solo_respuestas"))
+                    solo_resp = (modo_actual == "solo_respuestas")
+                    if st.session_state.get("usar_omr") and OMR_DISPONIBLE:
+                        res = procesar_imagen_hibrido(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
+                                                       solo_respuestas=solo_resp)
+                    else:
+                        res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
+                                               solo_respuestas=solo_resp)
                     res["hash"] = foto["hash"]
                     st.session_state.resultados[id_unico] = res
                     st.session_state.fotos_pendientes.pop(id_unico, None)
@@ -909,6 +1231,25 @@ with tab_revisar:
                     st.error(f"🚨 **Patrón sospechoso:** {datos_orig.get('motivo_sospecha','')}")
                 if sin_identificar:
                     st.warning("🆔 Falta identificar al alumno — completa al menos apellido paterno o cédula abajo.")
+
+                # ── Diagnóstico OMR ──────────────────────────────────
+                omr_meta = datos_orig.get("omr_meta")
+                if omr_meta and omr_meta.get("usado"):
+                    n_total = len(ref)
+                    pct_omr = round(omr_meta["n_omr_directo"] / n_total * 100) if n_total else 0
+                    st.caption(
+                        f"🔬 Motor OMR: **{pct_omr}%** resuelto directo por análisis de imagen "
+                        f"({omr_meta['n_omr_directo']}/{n_total}) · {omr_meta['n_enviadas_ia']} enviadas a IA"
+                        + (f" · ⚠️ {omr_meta['n_conflictos']} conflicto(s) OMR↔IA" if omr_meta.get('n_conflictos') else "")
+                    )
+                    if datos_orig.get("omr_diagnostico_bytes"):
+                        with st.expander("🔬 Ver diagnóstico OMR (qué burbuja detectó y con qué confianza)"):
+                            st.caption("🟢 alta confianza (OMR)  ·  🔵 revisada/confirmada por IA  ·  🔴 conflicto o sin resolver")
+                            st.image(datos_orig["omr_diagnostico_bytes"], use_container_width=True)
+                elif omr_meta and not omr_meta.get("usado"):
+                    st.caption(f"🔬 Motor OMR no se pudo usar en esta hoja ({omr_meta.get('motivo_fallback','?')}) "
+                               "— se procesó con el flujo 100% IA de siempre.")
+
                 # ── Datos editables del alumno ──────────────────────
                 if datos_orig.get("solo_respuestas"):
                     st.markdown("**Datos del alumno** *(modo solo-respuestas: complétalos a mano)*")
