@@ -1582,16 +1582,17 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
 # ═══════════════════════ fin motor OMR ═══════════════════════════════════
 
 
-st.set_page_config(
-    page_title="Revisor de Pruebas",
-    page_icon="📝",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-VERSION_APP = "4.0.2"
+VERSION_APP = "4.1.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
+# v4.1.0 (PLATAFORMA): el sitio deja de ser un script de una sola pantalla y
+# pasa a ser un router multipágina (st.navigation/st.Page) con una página de
+# inicio "Herramientas Docentes" -- el Revisor de Hojas de Respuestas queda
+# como la primera herramienta disponible, con espacio dejado para agregar
+# más herramientas de IA para docentes (ver convención documentada junto al
+# router, al final del archivo). Motor OMR sin cambios (OMR_ENGINE_VERSION
+# se mantiene) -- este cambio es puramente de estructura/navegación de la
+# app, no del motor de corrección.
 # Motor OMR v4: geometry_confidence + geometry_state (OK/WARNING/ERROR) +
 # geometry_source trazable (HOUGH/UNIFORM_FALLBACK/GEOMETRIC_BAND_FALLBACK)
 # por banda, fail-closed en la localización de la tabla y en la selección de
@@ -2585,536 +2586,597 @@ def generar_qr(url: str) -> bytes:
     return buf.read()
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ═══════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## ⚙️ Configuración")
-    if tiene_secret():
-        st.success("🔑 API Key desde secrets")
-    else:
-        st.session_state["api_key_input"] = st.text_input(
-            "API Key de Anthropic", type="password", placeholder="sk-ant-...")
-    curso = st.text_input("Nombre del curso", placeholder="Ej: 3°A — Historia 2026")
-    st.markdown("---")
-    st.markdown("**Número de preguntas**")
-    n_prev = st.session_state["n_preguntas"]
-    hay_procesadas = bool(st.session_state["resultados"])
-    n_nuevo = st.number_input("Preguntas", min_value=1, max_value=TEMPLATE_PROFILE["n_max"],
-                               value=n_prev, step=1, label_visibility="collapsed",
-                               disabled=hay_procesadas)
-    if hay_procesadas:
-        st.caption("🔒 Bloqueado: ya hay hojas procesadas con este N°. "
-                   "Usa **Limpiar todo** antes de cambiarlo (cambiarlo a medio camino "
-                   "descuadra el puntaje de las hojas ya analizadas).")
-    elif n_nuevo != n_prev:
-        st.session_state["n_preguntas"] = n_nuevo
-        st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
-        st.session_state["pauta"] = []
-        st.rerun()
-    st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
-    st.markdown("---")
-    st.markdown("**Modo de carga de fotos**")
-    opciones_modo = {
-        "completa": "📄 Hoja completa (recorte automático)",
-        "solo_respuestas": "✂️ Solo bloque RESPUESTAS (ya recortado por ti)",
-    }
-    modo_prev = st.session_state["modo_captura"]
-    modo_nuevo = st.radio(
-        "Modo de carga", options=list(opciones_modo.keys()),
-        format_func=lambda k: opciones_modo[k],
-        index=list(opciones_modo.keys()).index(modo_prev),
-        label_visibility="collapsed", disabled=hay_procesadas,
-    )
-    if hay_procesadas:
-        st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modo. Usa **Limpiar todo** antes de cambiarlo.")
-    elif modo_nuevo != modo_prev:
-        st.session_state["modo_captura"] = modo_nuevo
-        st.rerun()
-    if st.session_state["modo_captura"] == "solo_respuestas":
-        st.caption("✂️ Nombre, RUT y folleto quedan en blanco — se completan a mano.")
-    else:
-        st.caption("📄 La app recorta e identifica al alumno automáticamente.")
-    st.markdown("---")
-    st.markdown("**Motor de lectura**")
-    if not OMR_DISPONIBLE:
-        st.caption("🤖 Solo IA (motor OMR no disponible en este entorno).")
-    else:
-        omr_prev = st.session_state["usar_omr"]
-        omr_nuevo = st.toggle(
-            "🔬 Motor OMR — única fuente de las respuestas",
-            value=omr_prev, disabled=hay_procesadas,
-            help="Mide directamente qué tan oscura está cada burbuja (sin llamar a la API). Claude "
-                 "nunca lee burbujas, solo transcribe nombre/RUT. Lo que el motor no logra determinar "
-                 "con confianza queda dudoso, con su recorte, para corregir a mano — nunca se adivina.",
+def render_revisor_pruebas():
+    """Renderiza la herramienta completa "Revisor de Hojas de Respuestas"
+    (sidebar de configuracion + las 4 pestanas: Pauta, Cargar, Revisar,
+    Exportar). Antes corria a nivel de modulo; el comportamiento interno
+    es identico, solo quedo envuelto en una funcion para poder registrarse
+    como una pagina mas del router multipagina (ver el bloque de navegacion
+    al final del archivo).
+    """
+    # ═══════════════════════════════════════════════════════════════════════
+    # SIDEBAR
+    # ═══════════════════════════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown("## ⚙️ Configuración")
+        if tiene_secret():
+            st.success("🔑 API Key desde secrets")
+        else:
+            st.session_state["api_key_input"] = st.text_input(
+                "API Key de Anthropic", type="password", placeholder="sk-ant-...")
+        curso = st.text_input("Nombre del curso", placeholder="Ej: 3°A — Historia 2026")
+        st.markdown("---")
+        st.markdown("**Número de preguntas**")
+        n_prev = st.session_state["n_preguntas"]
+        hay_procesadas = bool(st.session_state["resultados"])
+        n_nuevo = st.number_input("Preguntas", min_value=1, max_value=TEMPLATE_PROFILE["n_max"],
+                                   value=n_prev, step=1, label_visibility="collapsed",
+                                   disabled=hay_procesadas)
+        if hay_procesadas:
+            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este N°. "
+                       "Usa **Limpiar todo** antes de cambiarlo (cambiarlo a medio camino "
+                       "descuadra el puntaje de las hojas ya analizadas).")
+        elif n_nuevo != n_prev:
+            st.session_state["n_preguntas"] = n_nuevo
+            st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
+            st.session_state["pauta"] = []
+            st.rerun()
+        st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
+        st.markdown("---")
+        st.markdown("**Modo de carga de fotos**")
+        opciones_modo = {
+            "completa": "📄 Hoja completa (recorte automático)",
+            "solo_respuestas": "✂️ Solo bloque RESPUESTAS (ya recortado por ti)",
+        }
+        modo_prev = st.session_state["modo_captura"]
+        modo_nuevo = st.radio(
+            "Modo de carga", options=list(opciones_modo.keys()),
+            format_func=lambda k: opciones_modo[k],
+            index=list(opciones_modo.keys()).index(modo_prev),
+            label_visibility="collapsed", disabled=hay_procesadas,
         )
         if hay_procesadas:
-            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este motor. Usa **Limpiar todo** antes de cambiarlo.")
-        elif omr_nuevo != omr_prev:
-            st.session_state["usar_omr"] = omr_nuevo
+            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modo. Usa **Limpiar todo** antes de cambiarlo.")
+        elif modo_nuevo != modo_prev:
+            st.session_state["modo_captura"] = modo_nuevo
             st.rerun()
-        if not st.session_state["usar_omr"]:
-            st.caption("🤖 Modo 100% IA: más lento, más caro y menos confiable — solo para comparar.")
-        elif st.session_state["usar_omr"]:
-            ia_arb_prev = st.session_state["ia_arbitraje_habilitado"]
-            ia_arb_nuevo = st.checkbox(
-                "🤖 Usar IA para arbitrar respuestas ambiguas (experimental)",
-                value=ia_arb_prev, disabled=hay_procesadas,
-                help="APAGADO por defecto: el OMR es la única fuente de A-E. Si se activa, Claude solo "
-                     "puede opinar sobre preguntas ambiguas/doble marca cuya geometría es sólida "
-                     "(GEOMETRY_OK) -- nunca sobre una respuesta ya confiable, ni sobre una banda sin "
-                     "evidencia geométrica real (GEOMETRY_ERROR).",
+        if st.session_state["modo_captura"] == "solo_respuestas":
+            st.caption("✂️ Nombre, RUT y folleto quedan en blanco — se completan a mano.")
+        else:
+            st.caption("📄 La app recorta e identifica al alumno automáticamente.")
+        st.markdown("---")
+        st.markdown("**Motor de lectura**")
+        if not OMR_DISPONIBLE:
+            st.caption("🤖 Solo IA (motor OMR no disponible en este entorno).")
+        else:
+            omr_prev = st.session_state["usar_omr"]
+            omr_nuevo = st.toggle(
+                "🔬 Motor OMR — única fuente de las respuestas",
+                value=omr_prev, disabled=hay_procesadas,
+                help="Mide directamente qué tan oscura está cada burbuja (sin llamar a la API). Claude "
+                     "nunca lee burbujas, solo transcribe nombre/RUT. Lo que el motor no logra determinar "
+                     "con confianza queda dudoso, con su recorte, para corregir a mano — nunca se adivina.",
             )
             if hay_procesadas:
-                st.caption("🔒 Bloqueado: ya hay hojas procesadas. Usa **Limpiar todo** antes de cambiarlo.")
-            elif ia_arb_nuevo != ia_arb_prev:
-                st.session_state["ia_arbitraje_habilitado"] = ia_arb_nuevo
+                st.caption("🔒 Bloqueado: ya hay hojas procesadas con este motor. Usa **Limpiar todo** antes de cambiarlo.")
+            elif omr_nuevo != omr_prev:
+                st.session_state["usar_omr"] = omr_nuevo
                 st.rerun()
-    st.markdown("---")
-    if st.button("🗑️ Limpiar todo", use_container_width=True):
-        nn = st.session_state["n_preguntas"]
-        st.session_state.update({
-            "resultados":{}, "correcciones":{}, "info_edits":{},
-            "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
-        })
-        st.rerun()
-    st.caption(f"Versión {VERSION_APP} · OMR {OMR_ENGINE_VERSION} · Actualizado {FECHA_ACTUALIZACION}")
-    st.caption(f"Desarrollado por {DESARROLLADO_POR}")
+            if not st.session_state["usar_omr"]:
+                st.caption("🤖 Modo 100% IA: más lento, más caro y menos confiable — solo para comparar.")
+            elif st.session_state["usar_omr"]:
+                ia_arb_prev = st.session_state["ia_arbitraje_habilitado"]
+                ia_arb_nuevo = st.checkbox(
+                    "🤖 Usar IA para arbitrar respuestas ambiguas (experimental)",
+                    value=ia_arb_prev, disabled=hay_procesadas,
+                    help="APAGADO por defecto: el OMR es la única fuente de A-E. Si se activa, Claude solo "
+                         "puede opinar sobre preguntas ambiguas/doble marca cuya geometría es sólida "
+                         "(GEOMETRY_OK) -- nunca sobre una respuesta ya confiable, ni sobre una banda sin "
+                         "evidencia geométrica real (GEOMETRY_ERROR).",
+                )
+                if hay_procesadas:
+                    st.caption("🔒 Bloqueado: ya hay hojas procesadas. Usa **Limpiar todo** antes de cambiarlo.")
+                elif ia_arb_nuevo != ia_arb_prev:
+                    st.session_state["ia_arbitraje_habilitado"] = ia_arb_nuevo
+                    st.rerun()
+        st.markdown("---")
+        if st.button("🗑️ Limpiar todo", use_container_width=True):
+            nn = st.session_state["n_preguntas"]
+            st.session_state.update({
+                "resultados":{}, "correcciones":{}, "info_edits":{},
+                "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
+            })
+            st.rerun()
+        st.caption(f"Versión {VERSION_APP} · OMR {OMR_ENGINE_VERSION} · Actualizado {FECHA_ACTUALIZACION}")
+        st.caption(f"Desarrollado por {DESARROLLADO_POR}")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# CUERPO
-# ═══════════════════════════════════════════════════════════════════════
-n = st.session_state["n_preguntas"]
-st.markdown("# 📝 Revisor de Hojas de Respuestas")
+    # ═══════════════════════════════════════════════════════════════════════
+    # CUERPO
+    # ═══════════════════════════════════════════════════════════════════════
+    n = st.session_state["n_preguntas"]
+    st.markdown("# 📝 Revisor de Hojas de Respuestas")
 
-tab_pauta, tab_cargar, tab_revisar, tab_exportar = st.tabs([
-    "📋 Pauta de respuestas",
-    "📤 Cargar fotos",
-    "✏️ Revisar y corregir",
-    "📊 Exportar Excel",
-])
+    tab_pauta, tab_cargar, tab_revisar, tab_exportar = st.tabs([
+        "📋 Pauta de respuestas",
+        "📤 Cargar fotos",
+        "✏️ Revisar y corregir",
+        "📊 Exportar Excel",
+    ])
 
-# ══ PAUTA ════════════════════════════════════════════════════════════
-with tab_pauta:
-    st.markdown(f"### Respuestas correctas — {n} preguntas")
-    st.caption("💡 Usa **Importar rápido** para pegar todas de una vez; la tabla solo para corregir 1-2 celdas.")
-    col_t, col_i = st.columns([2, 1], gap="large")
+    # ══ PAUTA ════════════════════════════════════════════════════════════
+    with tab_pauta:
+        st.markdown(f"### Respuestas correctas — {n} preguntas")
+        st.caption("💡 Usa **Importar rápido** para pegar todas de una vez; la tabla solo para corregir 1-2 celdas.")
+        col_t, col_i = st.columns([2, 1], gap="large")
 
-    with col_i:
-        st.markdown("**Importar rápido**")
-        texto_bulk = st.text_area("Importar", height=200, label_visibility="collapsed",
-            placeholder=f"A\nB\nC\n...\no bien: A,B,C,D,E,...\n({n} respuestas)")
-        if st.button("⬇️ Cargar al grid", use_container_width=True):
-            letras=[l.upper() for l in re.findall(r'[AaBbCcDdEe]', texto_bulk)]
-            if letras:
-                st.session_state["pauta_df"] = pd.DataFrame({
-                    "N°":[f"P{i}" for i in range(1,n+1)],
-                    "Respuesta": pd.array((letras+[None]*n)[:n], dtype="object"),
-                })
-                st.success(f"✓ {min(len(letras),n)} respuestas cargadas")
+        with col_i:
+            st.markdown("**Importar rápido**")
+            texto_bulk = st.text_area("Importar", height=200, label_visibility="collapsed",
+                placeholder=f"A\nB\nC\n...\no bien: A,B,C,D,E,...\n({n} respuestas)")
+            if st.button("⬇️ Cargar al grid", use_container_width=True):
+                letras=[l.upper() for l in re.findall(r'[AaBbCcDdEe]', texto_bulk)]
+                if letras:
+                    st.session_state["pauta_df"] = pd.DataFrame({
+                        "N°":[f"P{i}" for i in range(1,n+1)],
+                        "Respuesta": pd.array((letras+[None]*n)[:n], dtype="object"),
+                    })
+                    st.success(f"✓ {min(len(letras),n)} respuestas cargadas")
+                    st.rerun()
+                else:
+                    st.error("No se encontraron letras A–E válidas.")
+            st.markdown("---")
+            pauta_actual = pauta_desde_df(st.session_state["pauta_df"])
+            completadas  = sum(1 for p in pauta_actual if p)
+            st.metric("Con respuesta", f"{completadas} / {n}")
+            if completadas == n:
+                st.success("✅ Pauta completa")
+            elif completadas > 0:
+                falt=[i+1 for i,p in enumerate(pauta_actual) if not p]
+                st.warning(f"Faltan {n-completadas}: {', '.join(f'P{x}' for x in falt[:5])}{'...' if len(falt)>5 else ''}")
+
+        with col_t:
+            df_ed = st.data_editor(
+                st.session_state["pauta_df"],
+                column_config={
+                    "N°": st.column_config.TextColumn("N°", disabled=True, width="small"),
+                    "Respuesta": st.column_config.SelectboxColumn(
+                        "Respuesta", options=["A","B","C","D","E"], width="small", required=False),
+                },
+                hide_index=True, height=min(38*n+40, 560),
+                use_container_width=True, key="editor_pauta", num_rows="fixed",
+            )
+            st.session_state["pauta_df"] = df_ed
+            st.session_state["pauta"]    = pauta_desde_df(df_ed)
+
+        if any(st.session_state["pauta"]):
+            with st.expander("👁️ Vista previa"):
+                html="<div style='line-height:2.2;'>"
+                for i,p in enumerate(st.session_state["pauta"],1):
+                    bg="#dcfce7" if p else "#f3f4f6"; fg="#166534" if p else "#9ca3af"
+                    html+=(f'<span style="display:inline-block;width:50px;margin:2px;'
+                           f'background:{bg};color:{fg};border-radius:4px;'
+                           f'padding:2px 4px;font-size:12px;font-weight:600;">'
+                           f'P{i}:{p or "?"}</span>')
+                html+="</div>"
+                st.markdown(html, unsafe_allow_html=True)
+
+
+    # ══ CARGAR FOTOS ═════════════════════════════════════════════════════
+    with tab_cargar:
+        try:
+            app_url = st.secrets.get("APP_URL","")
+        except Exception:
+            app_url = ""
+
+        modo_actual = st.session_state["modo_captura"]
+
+        if app_url:
+            cq, ci = st.columns([1,2], gap="large")
+            with cq:
+                st.markdown("### 📱 Desde el celular")
+                st.image(generar_qr(app_url), width=180, caption="Escanea para abrir en tu celular")
+            with ci:
+                st.markdown("### Instrucciones")
+                if modo_actual == "solo_respuestas":
+                    st.markdown("""
+    1. Escanea el QR o entra a la URL en el navegador del celular
+    2. **Cargar fotos** → **Upload** → Cámara o Galería
+    3. Encuadra **solo el bloque RESPUESTAS completo** (las 4 columnas, sin cabecera), foto
+       derecha y con buena luz
+    4. Sube varias antes de procesar; nombre y RUT se completan a mano después
+    """)
+                else:
+                    st.markdown("""
+    1. Escanea el QR o entra a la URL en el navegador del celular
+    2. **Cargar fotos** → **Upload** → Cámara o Galería
+    3. Acerca la cámara a la hoja completa, con **las 4 columnas de RESPUESTAS visibles**,
+       foto derecha y con buena luz
+    4. Sube varias antes de procesar
+    """)
+        else:
+            st.info("Desde el celular: entra a la URL de esta app; al tocar Upload ofrece abrir la "
+                    "cámara directamente. Agrega `APP_URL` a Secrets para ver un QR aquí.")
+
+        st.markdown("---")
+        st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
+        st.caption("Clave para que el motor OMR lea bien: las 4 columnas de RESPUESTAS visibles, foto "
+                   "derecha, buena luz, sin fondo alrededor.")
+        st.caption("💡 Procesa de a **15–20 fotos por lote** — si se corta la conexión, no pierdes el resto.")
+        archivos = st.file_uploader("Fotos", type=["jpg","jpeg","png","webp"],
+                                     accept_multiple_files=True, label_visibility="collapsed",
+                                     key="uploader_fotos")
+
+        # Cada foto seleccionada se guarda de inmediato en session_state (por hash de
+        # contenido, no por nombre de archivo). Esto evita perder fotos anteriores cuando
+        # el celular reabre la cámara y reemplaza la selección del input, y evita
+        # colisiones cuando la cámara reutiliza el mismo nombre genérico (ej. "image.jpg").
+        if archivos:
+            hashes_conocidos = {v["hash"] for v in st.session_state.fotos_pendientes.values()}
+            hashes_conocidos |= {d.get("hash") for d in st.session_state.resultados.values()}
+            agregadas = 0
+            for f in archivos:
+                contenido = f.read()
+                h = hashlib.md5(contenido).hexdigest()
+                if h not in hashes_conocidos:
+                    # Se guarda tal cual (sin comprimir aquí): el recorte en mitades y la
+                    # compresión ocurren recién al procesar, a partir de la resolución
+                    # original, para maximizar el detalle de cada acercamiento.
+                    idx = len(st.session_state.fotos_pendientes) + len(st.session_state.resultados) + 1
+                    st.session_state.fotos_pendientes[f"foto_{idx:03d}"] = {
+                        "nombre": f.name, "bytes": contenido,
+                        "mime": TIPOS_MIME.get(f.type, "image/jpeg"), "hash": h,
+                    }
+                    hashes_conocidos.add(h)
+                    agregadas += 1
+            if agregadas:
                 st.rerun()
-            else:
-                st.error("No se encontraron letras A–E válidas.")
-        st.markdown("---")
-        pauta_actual = pauta_desde_df(st.session_state["pauta_df"])
-        completadas  = sum(1 for p in pauta_actual if p)
-        st.metric("Con respuesta", f"{completadas} / {n}")
-        if completadas == n:
-            st.success("✅ Pauta completa")
-        elif completadas > 0:
-            falt=[i+1 for i,p in enumerate(pauta_actual) if not p]
-            st.warning(f"Faltan {n-completadas}: {', '.join(f'P{x}' for x in falt[:5])}{'...' if len(falt)>5 else ''}")
 
-    with col_t:
-        df_ed = st.data_editor(
-            st.session_state["pauta_df"],
-            column_config={
-                "N°": st.column_config.TextColumn("N°", disabled=True, width="small"),
-                "Respuesta": st.column_config.SelectboxColumn(
-                    "Respuesta", options=["A","B","C","D","E"], width="small", required=False),
-            },
-            hide_index=True, height=min(38*n+40, 560),
-            use_container_width=True, key="editor_pauta", num_rows="fixed",
-        )
-        st.session_state["pauta_df"] = df_ed
-        st.session_state["pauta"]    = pauta_desde_df(df_ed)
+        # Mensaje del último procesamiento: se guarda en session_state porque el
+        # st.rerun() de más abajo redibuja la pantalla de inmediato y borraría un
+        # st.success/st.error mostrado en la misma corrida antes de que se alcance a leer.
+        if st.session_state.get("mensaje_proceso"):
+            tipo, texto = st.session_state.pop("mensaje_proceso")
+            (st.error if tipo == "error" else st.success)(texto)
 
-    if any(st.session_state["pauta"]):
-        with st.expander("👁️ Vista previa"):
-            html="<div style='line-height:2.2;'>"
-            for i,p in enumerate(st.session_state["pauta"],1):
-                bg="#dcfce7" if p else "#f3f4f6"; fg="#166534" if p else "#9ca3af"
-                html+=(f'<span style="display:inline-block;width:50px;margin:2px;'
-                       f'background:{bg};color:{fg};border-radius:4px;'
-                       f'padding:2px 4px;font-size:12px;font-weight:600;">'
-                       f'P{i}:{p or "?"}</span>')
-            html+="</div>"
-            st.markdown(html, unsafe_allow_html=True)
+        pendientes = st.session_state.fotos_pendientes
+        total_proc = len(st.session_state.resultados)
 
+        if pendientes or total_proc:
+            c1, c2 = st.columns(2)
+            if total_proc: c1.success(f"✓ {total_proc} ya procesadas")
+            if pendientes: c2.warning(f"⏳ {len(pendientes)} nuevas por procesar")
 
-# ══ CARGAR FOTOS ═════════════════════════════════════════════════════
-with tab_cargar:
-    try:
-        app_url = st.secrets.get("APP_URL","")
-    except Exception:
-        app_url = ""
-
-    modo_actual = st.session_state["modo_captura"]
-
-    if app_url:
-        cq, ci = st.columns([1,2], gap="large")
-        with cq:
-            st.markdown("### 📱 Desde el celular")
-            st.image(generar_qr(app_url), width=180, caption="Escanea para abrir en tu celular")
-        with ci:
-            st.markdown("### Instrucciones")
-            if modo_actual == "solo_respuestas":
-                st.markdown("""
-1. Escanea el QR o entra a la URL en el navegador del celular
-2. **Cargar fotos** → **Upload** → Cámara o Galería
-3. Encuadra **solo el bloque RESPUESTAS completo** (las 4 columnas, sin cabecera), foto
-   derecha y con buena luz
-4. Sube varias antes de procesar; nombre y RUT se completan a mano después
-""")
-            else:
-                st.markdown("""
-1. Escanea el QR o entra a la URL en el navegador del celular
-2. **Cargar fotos** → **Upload** → Cámara o Galería
-3. Acerca la cámara a la hoja completa, con **las 4 columnas de RESPUESTAS visibles**,
-   foto derecha y con buena luz
-4. Sube varias antes de procesar
-""")
-    else:
-        st.info("Desde el celular: entra a la URL de esta app; al tocar Upload ofrece abrir la "
-                "cámara directamente. Agrega `APP_URL` a Secrets para ver un QR aquí.")
-
-    st.markdown("---")
-    st.markdown(f"### Sube las fotos  ·  *{n} preguntas por prueba*")
-    st.caption("Clave para que el motor OMR lea bien: las 4 columnas de RESPUESTAS visibles, foto "
-               "derecha, buena luz, sin fondo alrededor.")
-    st.caption("💡 Procesa de a **15–20 fotos por lote** — si se corta la conexión, no pierdes el resto.")
-    archivos = st.file_uploader("Fotos", type=["jpg","jpeg","png","webp"],
-                                 accept_multiple_files=True, label_visibility="collapsed",
-                                 key="uploader_fotos")
-
-    # Cada foto seleccionada se guarda de inmediato en session_state (por hash de
-    # contenido, no por nombre de archivo). Esto evita perder fotos anteriores cuando
-    # el celular reabre la cámara y reemplaza la selección del input, y evita
-    # colisiones cuando la cámara reutiliza el mismo nombre genérico (ej. "image.jpg").
-    if archivos:
-        hashes_conocidos = {v["hash"] for v in st.session_state.fotos_pendientes.values()}
-        hashes_conocidos |= {d.get("hash") for d in st.session_state.resultados.values()}
-        agregadas = 0
-        for f in archivos:
-            contenido = f.read()
-            h = hashlib.md5(contenido).hexdigest()
-            if h not in hashes_conocidos:
-                # Se guarda tal cual (sin comprimir aquí): el recorte en mitades y la
-                # compresión ocurren recién al procesar, a partir de la resolución
-                # original, para maximizar el detalle de cada acercamiento.
-                idx = len(st.session_state.fotos_pendientes) + len(st.session_state.resultados) + 1
-                st.session_state.fotos_pendientes[f"foto_{idx:03d}"] = {
-                    "nombre": f.name, "bytes": contenido,
-                    "mime": TIPOS_MIME.get(f.type, "image/jpeg"), "hash": h,
-                }
-                hashes_conocidos.add(h)
-                agregadas += 1
-        if agregadas:
-            st.rerun()
-
-    # Mensaje del último procesamiento: se guarda en session_state porque el
-    # st.rerun() de más abajo redibuja la pantalla de inmediato y borraría un
-    # st.success/st.error mostrado en la misma corrida antes de que se alcance a leer.
-    if st.session_state.get("mensaje_proceso"):
-        tipo, texto = st.session_state.pop("mensaje_proceso")
-        (st.error if tipo == "error" else st.success)(texto)
-
-    pendientes = st.session_state.fotos_pendientes
-    total_proc = len(st.session_state.resultados)
-
-    if pendientes or total_proc:
-        c1, c2 = st.columns(2)
-        if total_proc: c1.success(f"✓ {total_proc} ya procesadas")
-        if pendientes: c2.warning(f"⏳ {len(pendientes)} nuevas por procesar")
-
-    if pendientes:
-        with st.expander(f"📋 Fotos por procesar ({len(pendientes)})"):
-            for id_unico, foto in pendientes.items():
-                st.caption(f"• {foto['nombre']}")
-        key = api_key_activa()
-        if not key:
-            st.error("Ingresa tu API Key en el panel lateral.")
-        elif st.button(f"🚀 Procesar {len(pendientes)} hoja(s)", type="primary", use_container_width=True):
-            cliente = anthropic.Anthropic(api_key=key, timeout=90.0, max_retries=1)
-            prog = st.progress(0, text="Iniciando...")
-            errs = []
-            items = list(pendientes.items())
-            for i, (id_unico, foto) in enumerate(items):
-                prog.progress(i/len(items), text=f"Procesando {foto['nombre']} ({i+1}/{len(items)})...")
-                try:
-                    solo_resp = (modo_actual == "solo_respuestas")
-                    if st.session_state.get("usar_omr") and OMR_DISPONIBLE:
-                        res = procesar_imagen_hibrido(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
-                                                       solo_respuestas=solo_resp,
-                                                       ia_arbitraje_habilitado=st.session_state.get(
-                                                           "ia_arbitraje_habilitado", False))
-                    else:
-                        res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
-                                               solo_respuestas=solo_resp)
-                    res["hash"] = foto["hash"]
-                    st.session_state.resultados[id_unico] = res
-                    st.session_state.fotos_pendientes.pop(id_unico, None)
-                except anthropic.APITimeoutError:
-                    errs.append(f"{foto['nombre']}: tiempo de espera agotado (conexión lenta) — quedó en la cola, reintenta.")
-                except Exception as e:
-                    errs.append(f"{foto['nombre']}: {e} — quedó en la cola, reintenta.")
-            prog.progress(1.0, text="¡Completado!")
-            if errs:
-                st.session_state["mensaje_proceso"] = ("error", "Errores:\n"+"\n".join(errs))
-            else:
-                st.session_state["mensaje_proceso"] = ("success", f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
-            st.rerun()
-    elif total_proc:
-        st.success("✅ Todas las fotos cargadas. Ve a **Revisar y corregir**.")
-    else:
-        st.markdown("""
-        <div style="border:2px dashed #d1d5db;border-radius:16px;padding:2.5rem;
-                    text-align:center;color:#6b7280;margin-top:1rem;">
-            <div style="font-size:3rem;">📷</div>
-            <div style="font-size:16px;margin-top:10px;font-weight:500;">
-                Arrastra fotos aquí o toca para seleccionar</div>
-            <div style="font-size:13px;margin-top:6px;">JPG · PNG · WEBP · Desde PC o celular</div>
-        </div>""", unsafe_allow_html=True)
-
-
-# ══ REVISAR Y CORREGIR ═══════════════════════════════════════════════
-with tab_revisar:
-    pauta = st.session_state["pauta"]
-
-    if not st.session_state.resultados:
-        st.info("Aún no hay hojas procesadas. Ve a **Cargar fotos**.")
-    else:
-        total_alumnos = len(st.session_state.resultados)
-        pendientes = sum(
-            1 for a,d in st.session_state.resultados.items()
-            if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
-        )
-        sospechosas = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
-        sin_id = sum(
-            1 for a, d in st.session_state.resultados.items()
-            if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
-                     or datos_efectivos(a).get("cedula"))
-        )
-        m1,m2,m3,m4,m5 = st.columns(5)
-        m1.metric("Alumnos procesados", total_alumnos)
-        m2.metric("Con dudas pendientes", pendientes)
-        m3.metric("Preguntas por prueba", n)
-        m4.metric("🚨 Patrón sospechoso", sospechosas)
-        m5.metric("🆔 Sin identificar", sin_id)
-        if sospechosas:
-            st.error(f"🚨 {sospechosas} hoja(s) con un patrón sospechoso o no leída — revísalas abajo antes de confiar en su puntaje.")
-        if sin_id:
-            st.warning(f"🆔 {sin_id} hoja(s) sin identificar — complétalas abajo antes de exportar.")
-        st.markdown("---")
-
-        for arch, datos_orig in st.session_state.resultados.items():
-            datos     = datos_efectivos(arch)
-            dudosas   = datos_orig.get("dudosas", [])
-            corr_arch = st.session_state.correcciones.get(arch, {})
-            pend_este = [d for d in dudosas if str(d) not in corr_arch]
-            sk        = safe_key(arch)
-
-            ref = respuestas_efectivas(arch)
-            if pauta:
-                co,inc,om,_ = calcular(ref, pauta[:len(ref)])
-                total_p = sum(1 for p in pauta if p)
-                pct = round(co/total_p*100,1) if total_p else 0
-                puntaje_str = f"**{pct}%** ({co}/{total_p})"
-            else:
-                puntaje_str = "_(sin pauta)_"
-
-            es_sospechoso  = bool(datos_orig.get("sospechoso"))
-            sin_identificar = not (datos.get("apellido_paterno") or datos.get("nombres") or datos.get("cedula"))
-            icono = "🚨" if es_sospechoso else ("🆔" if sin_identificar else ("⚠️" if pend_este else "✅"))
-            nombre_titulo = (f"{datos.get('apellido_paterno','')} {datos.get('nombres','')} — {datos.get('cedula','')}"
-                              if not sin_identificar
-                              else f"*(sin identificar — {datos_orig.get('archivo', arch)})*")
-            with st.expander(
-                f"{icono} {nombre_titulo} | {puntaje_str}",
-                expanded=bool(pend_este or es_sospechoso or sin_identificar)
-            ):
-                if es_sospechoso:
-                    st.error(f"🚨 **Patrón sospechoso:** {datos_orig.get('motivo_sospecha','')}")
-                if sin_identificar:
-                    st.warning("🆔 Falta identificar al alumno — completa al menos apellido paterno o cédula abajo.")
-
-                # ── Diagnóstico OMR ──────────────────────────────────
-                omr_meta = datos_orig.get("omr_meta")
-                if omr_meta and omr_meta.get("usado"):
-                    n_total = len(ref)
-                    pct_omr = round(omr_meta["n_confiable"] / n_total * 100) if n_total else 0
-                    st.caption(f"🔬 **{pct_omr}%** confiable ({omr_meta['n_confiable']}/{n_total}) · "
-                               f"{omr_meta['n_dudosas']} para revisar abajo")
-                    if omr_meta.get("n_geometry_error"):
-                        bandas_bajas = [i + 1 for i, g in enumerate(omr_meta.get("geometry_confidence_por_banda", []))
-                                        if g < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]]
-                        st.warning(f"🟣 {omr_meta['n_geometry_error']} pregunta(s) en la(s) columna(s) {bandas_bajas} "
-                                   "no tienen evidencia de estar sobre burbujas reales (posible margen/texto vecino "
-                                   "capturado de más) — quedaron para revisión manual, no se adivinaron.")
-                    if datos_orig.get("omr_diagnostico_bytes"):
-                        with st.expander("🔬 Ver diagnóstico OMR"):
-                            st.caption("🟢 confiable · 🟡 confianza media · 🔵 resuelta por IA · 🟣 sin evidencia de grilla · 🔴 dudosa · ⚪ en blanco")
-                            st.image(datos_orig["omr_diagnostico_bytes"], use_container_width=True)
-                elif omr_meta and not omr_meta.get("usado"):
-                    st.error(f"🔬 No se pudo leer con OMR ({omr_meta.get('motivo_fallback','?')}). "
-                             "Completa a mano abajo o vuelve a tomar la foto con las 4 columnas visibles.")
-
-                # ── Datos editables del alumno ──────────────────────
-                if datos_orig.get("solo_respuestas"):
-                    st.markdown("**Datos del alumno** *(modo solo-respuestas: complétalos a mano)*")
-                else:
-                    st.markdown("**Datos del alumno** *(edita si Claude leyó mal algún campo)*")
-                ie = st.session_state.info_edits.get(arch, {})
-
-                r1c1, r1c2, r1c3 = st.columns(3)
-                with r1c1:
-                    v = st.text_input("Apellido paterno",
-                        value=ie.get("apellido_paterno", datos_orig.get("apellido_paterno","")),
-                        key=f"ap_{sk}")
-                    guardar_info_edit(arch, "apellido_paterno", v)
-                with r1c2:
-                    v = st.text_input("Apellido materno",
-                        value=ie.get("apellido_materno", datos_orig.get("apellido_materno","")),
-                        key=f"am_{sk}")
-                    guardar_info_edit(arch, "apellido_materno", v)
-                with r1c3:
-                    v = st.text_input("Nombres",
-                        value=ie.get("nombres", datos_orig.get("nombres","")),
-                        key=f"no_{sk}")
-                    guardar_info_edit(arch, "nombres", v)
-
-                r2c1, r2c2, r2c3 = st.columns(3)
-                with r2c1:
-                    v = st.text_input("Cédula / RUT",
-                        value=ie.get("cedula", datos_orig.get("cedula","")),
-                        key=f"ce_{sk}")
-                    guardar_info_edit(arch, "cedula", v)
-                with r2c2:
-                    v = st.text_input("N° de folleto",
-                        value=ie.get("nro_folleto", datos_orig.get("nro_folleto","")),
-                        key=f"fo_{sk}")
-                    guardar_info_edit(arch, "nro_folleto", v)
-                with r2c3:
-                    st.markdown("&nbsp;")  # espaciador
-
-                # ── Respuestas dudosas ──────────────────────────────
-                if dudosas:
-                    st.markdown("---")
-                    st.markdown(f"**Preguntas dudosas:** {', '.join(f'P{d}' for d in dudosas)}")
-                    crops_dudosas = datos_orig.get("omr_crops_dudosas", {})
-                    if not crops_dudosas:
-                        st.caption("Selecciona la respuesta correcta para cada una:")
-
-                    # Renderizar en grupos de 6 (menos que antes: ahora cada columna
-                    # también lleva el recorte de la fila, así que necesitan más ancho)
-                    CHUNK = 6
-                    for chunk_start in range(0, len(dudosas), CHUNK):
-                        chunk = dudosas[chunk_start:chunk_start+CHUNK]
-                        cols  = st.columns(len(chunk))
-                        for j, num_p in enumerate(chunk):
-                            resp_orig = (datos_orig["respuestas"][num_p-1]
-                                         if num_p <= len(datos_orig["respuestas"]) else None)
-                            # Leer valor guardado en session_state directamente para evitar blank
-                            widget_key = f"dud_{sk}_{num_p}"
-                            saved_val  = corr_arch.get(str(num_p), resp_orig or "—")
-                            idx_opcion = OPCIONES.index(saved_val) if saved_val in OPCIONES else 5
-
-                            with cols[j]:
-                                crop_bytes = crops_dudosas.get(str(num_p))
-                                if crop_bytes:
-                                    st.image(crop_bytes, width=160)
-                                nueva = st.selectbox(
-                                    f"P{num_p}",
-                                    options=OPCIONES,
-                                    index=idx_opcion,
-                                    key=widget_key,
-                                )
-                                guardar_correccion(arch, num_p, nueva, resp_orig)
-                else:
-                    st.markdown("---")
-                    st.success("Sin preguntas dudosas.")
-
-                # ── Vista detalle de respuestas ─────────────────────
-                if pauta:
-                    ref_act = respuestas_efectivas(arch)
-                    st.markdown("---")
-                    st.markdown("**Detalle de respuestas:**")
-                    html="<div style='line-height:2.4;'>"
-                    for i,(r,p) in enumerate(zip(ref_act,pauta),1):
-                        es_dud  = i in dudosas
-                        fue_c   = str(i) in st.session_state.correcciones.get(arch,{}) and es_dud
-                        if r is None:
-                            cls="badge-null"; txt=f"P{i}:—"
-                        elif p and r.upper()==p.upper():
-                            cls="badge-ok";  txt=f"P{i}:{r}"
+        if pendientes:
+            with st.expander(f"📋 Fotos por procesar ({len(pendientes)})"):
+                for id_unico, foto in pendientes.items():
+                    st.caption(f"• {foto['nombre']}")
+            key = api_key_activa()
+            if not key:
+                st.error("Ingresa tu API Key en el panel lateral.")
+            elif st.button(f"🚀 Procesar {len(pendientes)} hoja(s)", type="primary", use_container_width=True):
+                cliente = anthropic.Anthropic(api_key=key, timeout=90.0, max_retries=1)
+                prog = st.progress(0, text="Iniciando...")
+                errs = []
+                items = list(pendientes.items())
+                for i, (id_unico, foto) in enumerate(items):
+                    prog.progress(i/len(items), text=f"Procesando {foto['nombre']} ({i+1}/{len(items)})...")
+                    try:
+                        solo_resp = (modo_actual == "solo_respuestas")
+                        if st.session_state.get("usar_omr") and OMR_DISPONIBLE:
+                            res = procesar_imagen_hibrido(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
+                                                           solo_respuestas=solo_resp,
+                                                           ia_arbitraje_habilitado=st.session_state.get(
+                                                               "ia_arbitraje_habilitado", False))
                         else:
-                            cls="badge-err"; txt=f"P{i}:{r or '?'}"
-                        if es_dud and not fue_c: cls="badge-dud"
-                        html+=f'<span class="corr-badge {cls}">{txt}{"✎" if fue_c else ""}</span>'
-                    html+="</div>"
-                    st.markdown(html, unsafe_allow_html=True)
+                            res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
+                                                   solo_respuestas=solo_resp)
+                        res["hash"] = foto["hash"]
+                        st.session_state.resultados[id_unico] = res
+                        st.session_state.fotos_pendientes.pop(id_unico, None)
+                    except anthropic.APITimeoutError:
+                        errs.append(f"{foto['nombre']}: tiempo de espera agotado (conexión lenta) — quedó en la cola, reintenta.")
+                    except Exception as e:
+                        errs.append(f"{foto['nombre']}: {e} — quedó en la cola, reintenta.")
+                prog.progress(1.0, text="¡Completado!")
+                if errs:
+                    st.session_state["mensaje_proceso"] = ("error", "Errores:\n"+"\n".join(errs))
+                else:
+                    st.session_state["mensaje_proceso"] = ("success", f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
+                st.rerun()
+        elif total_proc:
+            st.success("✅ Todas las fotos cargadas. Ve a **Revisar y corregir**.")
+        else:
+            st.markdown("""
+            <div style="border:2px dashed #d1d5db;border-radius:16px;padding:2.5rem;
+                        text-align:center;color:#6b7280;margin-top:1rem;">
+                <div style="font-size:3rem;">📷</div>
+                <div style="font-size:16px;margin-top:10px;font-weight:500;">
+                    Arrastra fotos aquí o toca para seleccionar</div>
+                <div style="font-size:13px;margin-top:6px;">JPG · PNG · WEBP · Desde PC o celular</div>
+            </div>""", unsafe_allow_html=True)
 
 
-# ══ EXPORTAR ═════════════════════════════════════════════════════════
-with tab_exportar:
-    pauta = st.session_state["pauta"]
+    # ══ REVISAR Y CORREGIR ═══════════════════════════════════════════════
+    with tab_revisar:
+        pauta = st.session_state["pauta"]
 
-    if not st.session_state.resultados:
-        st.info("Procesa al menos una hoja antes de exportar.")
-    elif not any(pauta):
-        st.error("Ve a **Pauta de respuestas** e ingresa las respuestas correctas primero.")
-    else:
-        pend_exp = sum(
-            1 for a,d in st.session_state.resultados.items()
-            if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
-        )
-        total_p=sum(1 for p in pauta if p)
-        sospechosas_exp = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
-        sin_id_exp = sum(
-            1 for a in st.session_state.resultados
-            if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
-                     or datos_efectivos(a).get("cedula"))
-        )
-        m1,m2,m3,m4,m5=st.columns(5)
-        m1.metric("Alumnos",len(st.session_state.resultados))
-        m2.metric("Preguntas evaluadas",total_p)
-        m3.metric("Dudas pendientes",pend_exp,
-                  delta="revisar antes" if pend_exp else "todo resuelto",
-                  delta_color="inverse" if pend_exp else "normal")
-        m4.metric("🚨 Sospechosas",sospechosas_exp,
-                  delta="revisar antes" if sospechosas_exp else "ninguna",
-                  delta_color="inverse" if sospechosas_exp else "normal")
-        m5.metric("🆔 Sin identificar",sin_id_exp,
-                  delta="completar antes" if sin_id_exp else "todo identificado",
-                  delta_color="inverse" if sin_id_exp else "normal")
+        if not st.session_state.resultados:
+            st.info("Aún no hay hojas procesadas. Ve a **Cargar fotos**.")
+        else:
+            total_alumnos = len(st.session_state.resultados)
+            pendientes = sum(
+                1 for a,d in st.session_state.resultados.items()
+                if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
+            )
+            sospechosas = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
+            sin_id = sum(
+                1 for a, d in st.session_state.resultados.items()
+                if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
+                         or datos_efectivos(a).get("cedula"))
+            )
+            m1,m2,m3,m4,m5 = st.columns(5)
+            m1.metric("Alumnos procesados", total_alumnos)
+            m2.metric("Con dudas pendientes", pendientes)
+            m3.metric("Preguntas por prueba", n)
+            m4.metric("🚨 Patrón sospechoso", sospechosas)
+            m5.metric("🆔 Sin identificar", sin_id)
+            if sospechosas:
+                st.error(f"🚨 {sospechosas} hoja(s) con un patrón sospechoso o no leída — revísalas abajo antes de confiar en su puntaje.")
+            if sin_id:
+                st.warning(f"🆔 {sin_id} hoja(s) sin identificar — complétalas abajo antes de exportar.")
+            st.markdown("---")
 
-        if sospechosas_exp:
-            st.error(f"🚨 {sospechosas_exp} hoja(s) sospechosa(s) o no leída(s) — revísalas en **Revisar y corregir**.")
-        if sin_id_exp:
-            st.warning(f"🆔 {sin_id_exp} hoja(s) sin identificar — quedarán en blanco en el Excel.")
-        if pend_exp:
-            st.warning(f"⚠️ {pend_exp} alumno(s) con dudas sin corregir — quedarán en amarillo.")
-        elif not sospechosas_exp and not sin_id_exp:
-            st.success("✅ Todo revisado. El Excel estará completo.")
+            for arch, datos_orig in st.session_state.resultados.items():
+                datos     = datos_efectivos(arch)
+                dudosas   = datos_orig.get("dudosas", [])
+                corr_arch = st.session_state.correcciones.get(arch, {})
+                pend_este = [d for d in dudosas if str(d) not in corr_arch]
+                sk        = safe_key(arch)
 
-        nombre_xl=f"resultados_{curso.replace(' ','_') if curso else 'curso'}.xlsx"
-        excel=generar_excel(pauta, curso)
-        st.download_button(
-            label="⬇️ Descargar Excel", data=excel,
-            file_name=nombre_xl,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary", use_container_width=True,
-        )
-        st.caption("El Excel incluye Resumen, Detalle de respuestas, Estadísticas y Pauta utilizada — "
-                   "la columna **Curso** en Resumen permite unir varios exports en un archivo maestro.")
+                ref = respuestas_efectivas(arch)
+                if pauta:
+                    co,inc,om,_ = calcular(ref, pauta[:len(ref)])
+                    total_p = sum(1 for p in pauta if p)
+                    pct = round(co/total_p*100,1) if total_p else 0
+                    puntaje_str = f"**{pct}%** ({co}/{total_p})"
+                else:
+                    puntaje_str = "_(sin pauta)_"
+
+                es_sospechoso  = bool(datos_orig.get("sospechoso"))
+                sin_identificar = not (datos.get("apellido_paterno") or datos.get("nombres") or datos.get("cedula"))
+                icono = "🚨" if es_sospechoso else ("🆔" if sin_identificar else ("⚠️" if pend_este else "✅"))
+                nombre_titulo = (f"{datos.get('apellido_paterno','')} {datos.get('nombres','')} — {datos.get('cedula','')}"
+                                  if not sin_identificar
+                                  else f"*(sin identificar — {datos_orig.get('archivo', arch)})*")
+                with st.expander(
+                    f"{icono} {nombre_titulo} | {puntaje_str}",
+                    expanded=bool(pend_este or es_sospechoso or sin_identificar)
+                ):
+                    if es_sospechoso:
+                        st.error(f"🚨 **Patrón sospechoso:** {datos_orig.get('motivo_sospecha','')}")
+                    if sin_identificar:
+                        st.warning("🆔 Falta identificar al alumno — completa al menos apellido paterno o cédula abajo.")
+
+                    # ── Diagnóstico OMR ──────────────────────────────────
+                    omr_meta = datos_orig.get("omr_meta")
+                    if omr_meta and omr_meta.get("usado"):
+                        n_total = len(ref)
+                        pct_omr = round(omr_meta["n_confiable"] / n_total * 100) if n_total else 0
+                        st.caption(f"🔬 **{pct_omr}%** confiable ({omr_meta['n_confiable']}/{n_total}) · "
+                                   f"{omr_meta['n_dudosas']} para revisar abajo")
+                        if omr_meta.get("n_geometry_error"):
+                            bandas_bajas = [i + 1 for i, g in enumerate(omr_meta.get("geometry_confidence_por_banda", []))
+                                            if g < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]]
+                            st.warning(f"🟣 {omr_meta['n_geometry_error']} pregunta(s) en la(s) columna(s) {bandas_bajas} "
+                                       "no tienen evidencia de estar sobre burbujas reales (posible margen/texto vecino "
+                                       "capturado de más) — quedaron para revisión manual, no se adivinaron.")
+                        if datos_orig.get("omr_diagnostico_bytes"):
+                            with st.expander("🔬 Ver diagnóstico OMR"):
+                                st.caption("🟢 confiable · 🟡 confianza media · 🔵 resuelta por IA · 🟣 sin evidencia de grilla · 🔴 dudosa · ⚪ en blanco")
+                                st.image(datos_orig["omr_diagnostico_bytes"], use_container_width=True)
+                    elif omr_meta and not omr_meta.get("usado"):
+                        st.error(f"🔬 No se pudo leer con OMR ({omr_meta.get('motivo_fallback','?')}). "
+                                 "Completa a mano abajo o vuelve a tomar la foto con las 4 columnas visibles.")
+
+                    # ── Datos editables del alumno ──────────────────────
+                    if datos_orig.get("solo_respuestas"):
+                        st.markdown("**Datos del alumno** *(modo solo-respuestas: complétalos a mano)*")
+                    else:
+                        st.markdown("**Datos del alumno** *(edita si Claude leyó mal algún campo)*")
+                    ie = st.session_state.info_edits.get(arch, {})
+
+                    r1c1, r1c2, r1c3 = st.columns(3)
+                    with r1c1:
+                        v = st.text_input("Apellido paterno",
+                            value=ie.get("apellido_paterno", datos_orig.get("apellido_paterno","")),
+                            key=f"ap_{sk}")
+                        guardar_info_edit(arch, "apellido_paterno", v)
+                    with r1c2:
+                        v = st.text_input("Apellido materno",
+                            value=ie.get("apellido_materno", datos_orig.get("apellido_materno","")),
+                            key=f"am_{sk}")
+                        guardar_info_edit(arch, "apellido_materno", v)
+                    with r1c3:
+                        v = st.text_input("Nombres",
+                            value=ie.get("nombres", datos_orig.get("nombres","")),
+                            key=f"no_{sk}")
+                        guardar_info_edit(arch, "nombres", v)
+
+                    r2c1, r2c2, r2c3 = st.columns(3)
+                    with r2c1:
+                        v = st.text_input("Cédula / RUT",
+                            value=ie.get("cedula", datos_orig.get("cedula","")),
+                            key=f"ce_{sk}")
+                        guardar_info_edit(arch, "cedula", v)
+                    with r2c2:
+                        v = st.text_input("N° de folleto",
+                            value=ie.get("nro_folleto", datos_orig.get("nro_folleto","")),
+                            key=f"fo_{sk}")
+                        guardar_info_edit(arch, "nro_folleto", v)
+                    with r2c3:
+                        st.markdown("&nbsp;")  # espaciador
+
+                    # ── Respuestas dudosas ──────────────────────────────
+                    if dudosas:
+                        st.markdown("---")
+                        st.markdown(f"**Preguntas dudosas:** {', '.join(f'P{d}' for d in dudosas)}")
+                        crops_dudosas = datos_orig.get("omr_crops_dudosas", {})
+                        if not crops_dudosas:
+                            st.caption("Selecciona la respuesta correcta para cada una:")
+
+                        # Renderizar en grupos de 6 (menos que antes: ahora cada columna
+                        # también lleva el recorte de la fila, así que necesitan más ancho)
+                        CHUNK = 6
+                        for chunk_start in range(0, len(dudosas), CHUNK):
+                            chunk = dudosas[chunk_start:chunk_start+CHUNK]
+                            cols  = st.columns(len(chunk))
+                            for j, num_p in enumerate(chunk):
+                                resp_orig = (datos_orig["respuestas"][num_p-1]
+                                             if num_p <= len(datos_orig["respuestas"]) else None)
+                                # Leer valor guardado en session_state directamente para evitar blank
+                                widget_key = f"dud_{sk}_{num_p}"
+                                saved_val  = corr_arch.get(str(num_p), resp_orig or "—")
+                                idx_opcion = OPCIONES.index(saved_val) if saved_val in OPCIONES else 5
+
+                                with cols[j]:
+                                    crop_bytes = crops_dudosas.get(str(num_p))
+                                    if crop_bytes:
+                                        st.image(crop_bytes, width=160)
+                                    nueva = st.selectbox(
+                                        f"P{num_p}",
+                                        options=OPCIONES,
+                                        index=idx_opcion,
+                                        key=widget_key,
+                                    )
+                                    guardar_correccion(arch, num_p, nueva, resp_orig)
+                    else:
+                        st.markdown("---")
+                        st.success("Sin preguntas dudosas.")
+
+                    # ── Vista detalle de respuestas ─────────────────────
+                    if pauta:
+                        ref_act = respuestas_efectivas(arch)
+                        st.markdown("---")
+                        st.markdown("**Detalle de respuestas:**")
+                        html="<div style='line-height:2.4;'>"
+                        for i,(r,p) in enumerate(zip(ref_act,pauta),1):
+                            es_dud  = i in dudosas
+                            fue_c   = str(i) in st.session_state.correcciones.get(arch,{}) and es_dud
+                            if r is None:
+                                cls="badge-null"; txt=f"P{i}:—"
+                            elif p and r.upper()==p.upper():
+                                cls="badge-ok";  txt=f"P{i}:{r}"
+                            else:
+                                cls="badge-err"; txt=f"P{i}:{r or '?'}"
+                            if es_dud and not fue_c: cls="badge-dud"
+                            html+=f'<span class="corr-badge {cls}">{txt}{"✎" if fue_c else ""}</span>'
+                        html+="</div>"
+                        st.markdown(html, unsafe_allow_html=True)
+
+
+    # ══ EXPORTAR ═════════════════════════════════════════════════════════
+    with tab_exportar:
+        pauta = st.session_state["pauta"]
+
+        if not st.session_state.resultados:
+            st.info("Procesa al menos una hoja antes de exportar.")
+        elif not any(pauta):
+            st.error("Ve a **Pauta de respuestas** e ingresa las respuestas correctas primero.")
+        else:
+            pend_exp = sum(
+                1 for a,d in st.session_state.resultados.items()
+                if [x for x in d.get("dudosas",[]) if str(x) not in st.session_state.correcciones.get(a,{})]
+            )
+            total_p=sum(1 for p in pauta if p)
+            sospechosas_exp = sum(1 for d in st.session_state.resultados.values() if d.get("sospechoso"))
+            sin_id_exp = sum(
+                1 for a in st.session_state.resultados
+                if not (datos_efectivos(a).get("apellido_paterno") or datos_efectivos(a).get("nombres")
+                         or datos_efectivos(a).get("cedula"))
+            )
+            m1,m2,m3,m4,m5=st.columns(5)
+            m1.metric("Alumnos",len(st.session_state.resultados))
+            m2.metric("Preguntas evaluadas",total_p)
+            m3.metric("Dudas pendientes",pend_exp,
+                      delta="revisar antes" if pend_exp else "todo resuelto",
+                      delta_color="inverse" if pend_exp else "normal")
+            m4.metric("🚨 Sospechosas",sospechosas_exp,
+                      delta="revisar antes" if sospechosas_exp else "ninguna",
+                      delta_color="inverse" if sospechosas_exp else "normal")
+            m5.metric("🆔 Sin identificar",sin_id_exp,
+                      delta="completar antes" if sin_id_exp else "todo identificado",
+                      delta_color="inverse" if sin_id_exp else "normal")
+
+            if sospechosas_exp:
+                st.error(f"🚨 {sospechosas_exp} hoja(s) sospechosa(s) o no leída(s) — revísalas en **Revisar y corregir**.")
+            if sin_id_exp:
+                st.warning(f"🆔 {sin_id_exp} hoja(s) sin identificar — quedarán en blanco en el Excel.")
+            if pend_exp:
+                st.warning(f"⚠️ {pend_exp} alumno(s) con dudas sin corregir — quedarán en amarillo.")
+            elif not sospechosas_exp and not sin_id_exp:
+                st.success("✅ Todo revisado. El Excel estará completo.")
+
+            nombre_xl=f"resultados_{curso.replace(' ','_') if curso else 'curso'}.xlsx"
+            excel=generar_excel(pauta, curso)
+            st.download_button(
+                label="⬇️ Descargar Excel", data=excel,
+                file_name=nombre_xl,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True,
+            )
+            st.caption("El Excel incluye Resumen, Detalle de respuestas, Estadísticas y Pauta utilizada — "
+                       "la columna **Curso** en Resumen permite unir varios exports en un archivo maestro.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLATAFORMA — página de inicio + router multipágina
+# ═══════════════════════════════════════════════════════════════════════
+def render_inicio():
+    """Página de bienvenida a la plataforma: presenta las herramientas
+    disponibles (hoy, solo el Revisor de Pruebas) y deja espacio visual para
+    las que se agreguen después."""
+    st.markdown("# 🎓 Herramientas Docentes")
+    st.caption("Herramientas para apoyar la revisión y corrección de recursos educativos.")
+    st.markdown("---")
+
+    with st.container(border=True):
+        col_desc, col_boton = st.columns([3, 1])
+        with col_desc:
+            st.markdown("### 📝 Revisor de Hojas de Respuestas")
+            st.markdown(
+                "Corrige hojas de respuestas tipo PAES (80 preguntas, 4 bloques, "
+                "alternativas A-E) a partir de fotos: detecta la grilla automáticamente, "
+                "lee las marcas y arma el Excel de resultados."
+            )
+            st.markdown('<span class="corr-badge badge-ok">Disponible</span>', unsafe_allow_html=True)
+        with col_boton:
+            st.markdown("")
+            st.page_link(pagina_revisor, label="Abrir →", icon="📝", use_container_width=True)
+
+    st.caption("✨ Más herramientas de IA para docentes están en camino.")
+
+
+# Convención para agregar una herramienta nueva a la plataforma:
+#   1. Una función render_xxx() que dibuje esa herramienta -- en este mismo
+#      archivo si es chica y comparte código con el motor OMR, o en un
+#      archivo nuevo importado acá si es grande e independiente.
+#   2. Una entrada st.Page(render_xxx, title=..., icon=...) en el diccionario
+#      de abajo, dentro de "Herramientas".
+#   3. Una tarjeta correspondiente en render_inicio().
+st.set_page_config(
+    page_title="Herramientas Docentes",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+pagina_inicio = st.Page(render_inicio, title="Inicio", icon="🏠", default=True, url_path="inicio")
+pagina_revisor = st.Page(render_revisor_pruebas, title="Revisor de Pruebas", icon="📝",
+                          url_path="revisor-de-pruebas")
+
+pg = st.navigation({
+    "Plataforma": [pagina_inicio],
+    "Herramientas": [pagina_revisor],
+})
+pg.run()
