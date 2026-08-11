@@ -39,7 +39,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "2.0.0"
+VERSION_APP = "2.1.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
@@ -78,7 +78,7 @@ for k, v in {
     "fotos_pendientes": {},  # {id_unico: {nombre, bytes, mime, hash}} — subidas sin procesar aún
     "pauta_df": df_pauta_vacio(80),
     "modo_captura": "completa",  # "completa" | "solo_respuestas"
-    "usar_omr": False,           # motor OMR + IA solo para dudas (beta)
+    "usar_omr": True,             # motor OMR es el método principal; la IA solo apoya en dudas e identificación
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -550,8 +550,17 @@ def analizar_hoja_omr(datos_bytes: bytes, solo_respuestas: bool, n: int) -> dict
     resultados = salida["resultados"]
     n_disponibles = len(resultados)
     if n_disponibles < n:
-        # la hoja/recorte tiene menos filas detectadas que preguntas configuradas
-        resultados = resultados + [{"letra": None, "status": "sin_marca", "omr_confidence": 0.0}] * (n - n_disponibles)
+        # La tabla detectada cubre menos columnas de las que hacen falta para
+        # n preguntas (p.ej. la foto no llegó a mostrar la 4ª columna, o la
+        # detección de bandas no logró separarlas todas). Rellenar con
+        # resultados "fantasma" es peligroso: no tienen banda/fila real en la
+        # grilla, así que cualquier recorte o anotación posterior sobre esas
+        # posiciones revienta con un índice fuera de rango. Es más seguro
+        # tratar esto como un fallo del pipeline OMR y caer al flujo 100%-IA
+        # para esta hoja en particular.
+        raise omr.OMRError(
+            f"La tabla detectada solo cubre {n_disponibles} de las {n} preguntas configuradas "
+            "(probablemente la foto no muestra todas las columnas de RESPUESTAS).")
     salida["resultados"] = resultados[:n]
     salida["img_bgr_original"] = img_bgr
     salida["quad_respuestas"] = None if solo_respuestas else omr.detectar_bloque_respuestas(img_bgr)
@@ -919,11 +928,14 @@ with st.sidebar:
     else:
         omr_prev = st.session_state["usar_omr"]
         omr_nuevo = st.toggle(
-            "🔬 Motor OMR + IA solo para dudas (beta)",
+            "🔬 Motor OMR (método principal) + IA de apoyo",
             value=omr_prev, disabled=hay_procesadas,
-            help="Mide directamente qué tan oscura está cada burbuja (visión clásica, sin llamar a la "
-                 "API) y solo manda a Claude las preguntas donde no queda claro cuál está marcada. Más "
-                 "rápido y barato; si en algún punto falla, cae automáticamente al modo 100% IA de siempre.",
+            help="Método principal de esta app: mide directamente qué tan oscura está cada burbuja "
+                 "(visión clásica, sin llamar a la API) y SOLO recurre a Claude para las preguntas donde "
+                 "no queda claro cuál está marcada, y para transcribir nombre/RUT. Más rápido, más barato "
+                 "y — validado contra fotos reales — más preciso que pedirle a la IA que lea las 400 "
+                 "burbujas de una hoja completa. Si en algún punto falla, esa hoja cae automáticamente al "
+                 "modo 100% IA de respaldo, sin perderse.",
         )
         if hay_procesadas:
             st.caption("🔒 Bloqueado: ya hay hojas procesadas con este motor. Usa **Limpiar todo** antes de cambiarlo.")
@@ -931,9 +943,13 @@ with st.sidebar:
             st.session_state["usar_omr"] = omr_nuevo
             st.rerun()
         if st.session_state["usar_omr"]:
-            st.caption("🔬 La mayoría de las preguntas se resuelven por análisis directo de imagen; solo "
-                       "las dudosas se envían a Claude. Revisa el diagnóstico OMR de cada hoja en "
-                       "**Revisar y corregir** antes de confiar en el resultado mientras está en beta.")
+            st.caption("🔬 **Configuración recomendada.** La mayoría de las preguntas se resuelven por análisis "
+                       "directo de imagen (sin llamar a la API); solo las dudosas van a Claude, junto con "
+                       "nombre/RUT. Puedes revisar el diagnóstico de cada hoja (qué burbuja detectó y con qué "
+                       "confianza) en **Revisar y corregir**.")
+        else:
+            st.caption("🤖 Modo 100% IA (el que usaba la app antes del motor OMR) — más lento y más caro por "
+                       "hoja. Útil para comparar o si el motor OMR falla repetidamente con tus fotos.")
     st.markdown("---")
     if st.button("🗑️ Limpiar todo", use_container_width=True):
         nn = st.session_state["n_preguntas"]
@@ -1053,8 +1069,10 @@ with tab_cargar:
 4. **Acerca el celular a la hoja** hasta que ocupe todo el encuadre (sin mesa, ropa
    ni pies alrededor) — con 80 preguntas cada burbuja es diminuta, así que entre
    más grande se vea la hoja en la foto, más fácil es distinguir cuál está marcada
-5. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
-6. Sube varias antes de procesar
+5. **Que se vean las 4 columnas completas del bloque RESPUESTAS** — si la foto corta
+   una columna, esa hoja no se puede leer por OMR y se procesa más lento (solo IA)
+6. Foto derecha (no en ángulo), buena luz, sin sombras sobre el papel
+7. Sube varias antes de procesar
 """)
     else:
         st.info("Desde el celular: entra a la URL de esta app en el navegador. "
@@ -1066,14 +1084,14 @@ with tab_cargar:
     st.caption("En el celular puedes tocar el recuadro varias veces para tomar una foto a la vez: "
                "cada una queda guardada aunque la cámara se abra de nuevo.")
     if modo_actual == "solo_respuestas":
-        st.caption("✂️ **Clave para que la IA lea bien:** la foto debe mostrar ÚNICAMENTE el bloque "
-                   "RESPUESTAS (sin cabecera de nombre/RUT), encuadrada derecha, sin fondo alrededor y con "
-                   "buena luz. Al no compartir resolución con la cabecera, cada burbuja se ve mucho más grande.")
+        st.caption("✂️ **Clave para que el motor OMR lea bien:** la foto debe mostrar el bloque RESPUESTAS "
+                   "COMPLETO (las 4 columnas, sin cabecera de nombre/RUT), encuadrada derecha, sin fondo "
+                   "alrededor y con buena luz.")
     else:
-        st.caption("📸 **Clave para que la IA lea bien:** acerca la cámara y llena el encuadre con la hoja "
-                   "(sin fondo alrededor), foto derecha y con buena luz. Con 80 preguntas × 5 burbujas en una "
-                   "sola foto, cada burbuja es muy pequeña — mientras más cerca y nítida la tomes, mejor detecta "
-                   "cuál está marcada.")
+        st.caption("📸 **Clave para que el motor OMR lea bien:** acerca la cámara y llena el encuadre con la "
+                   "hoja completa, con las 4 columnas de RESPUESTAS visibles, foto derecha y con buena luz — "
+                   "sin fondo alrededor. La IA solo entra a apoyar en las preguntas puntuales donde el motor "
+                   "OMR queda con dudas, así que la calidad de la foto sigue importando.")
     st.caption("💡 Recomendado: procesa de a **15–20 fotos por lote** (no 40–80 de una vez). "
                "Así el progreso no se pierde si el celular se bloquea o hay corte de conexión, "
                "y luego puedes exportar cada lote y unirlos en un Excel maestro.")

@@ -341,6 +341,9 @@ def recortar_pregunta(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers,
     """
     n_filas = len(y_centers_por_banda[0])
     bi, ri = divmod(idx_local, n_filas)
+    if bi >= len(band_x_centers):
+        raise OMRError(f"idx_local={idx_local} cae fuera de las {len(band_x_centers)} bandas detectadas "
+                        f"({n_filas} filas/banda) — la grilla no cubre esa pregunta.")
     band_x = band_x_centers[bi]
     cy = y_centers_por_banda[bi][ri]
     x0 = band_x[0] - radio * 3.2
@@ -372,6 +375,8 @@ def anotar_diagnostico(body_bgr: np.ndarray, y_centers_por_banda, band_x_centers
     n_filas = len(y_centers_por_banda[0])
     for idx, r in enumerate(resultados):
         bi, ri = divmod(idx, n_filas)
+        if bi >= len(band_x_centers):
+            continue  # pregunta sin banda/fila real en esta grilla (no debería llegar aquí; se ignora en vez de romper el diagnóstico)
         band_x = band_x_centers[bi]
         cy = y_centers_por_banda[bi][ri] * escala
         q = offset_pregunta + idx + 1
