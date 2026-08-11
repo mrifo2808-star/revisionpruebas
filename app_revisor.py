@@ -68,6 +68,20 @@ except Exception:
 #   5. medir cuánto más oscura está cada burbuja que el papel en blanco,
 #      comparando SIEMPRE dentro de la misma fila, con baseline/peak
 #      calculados POR BANDA (no globales) para tolerar iluminación despareja.
+#
+# Detección a escala de referencia, medición a resolución completa: los pasos
+# 1-4 (encontrar dónde están la tabla, las columnas, las filas y las burbujas)
+# se calculan siempre sobre una copia reescalada a un ancho de referencia fijo
+# (ver _omr_escalar_para_deteccion) -- NUNCA sobre la foto original completa --
+# y esas coordenadas se escalan de vuelta antes del paso 5. Se encontró de
+# forma directa que sin este paso, la misma foto real que da 100% de exactitud
+# a la resolución con la que se calibró Hough/blur cae a ~21% con solo 4/80
+# preguntas resueltas si se la reescala 4x (una foto de celular moderna
+# fácilmente tiene 4-6x más resolución que esa referencia): el blur de kernel
+# fijo y los umbrales de Hough dejan de ser apropiados para círculos mucho más
+# grandes en píxeles. La foto original en sí NUNCA se reduce -- el paso 5
+# (medir oscuridad, recortar preguntas dudosas) siempre usa la resolución
+# completa; solo la búsqueda de geometría usa una copia más chica.
 # ═══════════════════════════════════════════════════════════════════════
 
 OMR_THRESHOLDS = {
@@ -405,11 +419,58 @@ def omr_anotar_diagnostico(body_bgr, y_centers_por_banda, band_x_centers, radio,
     return dbg
 
 
+OMR_ANCHO_REF_PAGINA = 1000   # ancho de referencia para localizar la tabla en la hoja completa
+OMR_ANCHO_REF_TABLA = 480     # ancho de referencia para la tabla YA recortada (columnas/filas/círculos)
+# Ambas referencias importan por separado: la tabla recortada es solo una
+# fracción de la hoja completa (~4 columnas de burbujas), así que su propio
+# ancho de referencia tiene que ser mucho más chico que el de la página
+# entera -- usar el mismo valor para las dos etapas (bug real de una versión
+# anterior de este fix) dejaba la segunda etapa corriendo a una escala varias
+# veces más grande que aquella con la que se calibraron los parámetros de
+# Hough, reproduciendo el mismo problema que se buscaba resolver.
+
+
+def _omr_escalar_para_deteccion(img_bgr, ancho_referencia):
+    """
+    Devuelve (imagen_reescalada, escala) para las etapas de DETECCIÓN de
+    geometría (contornos, huecos entre columnas, círculos de Hough). Nunca
+    agranda -- solo achica si la imagen es más ancha que la referencia.
+
+    Por qué existe: la app deliberadamente NUNCA reduce la resolución de la
+    foto original antes de procesarla (para no perder detalle de las marcas a
+    lápiz), pero una foto de celular moderna puede tener 3000-4000px de ancho,
+    varias veces más que la imagen con la que se calibraron los parámetros de
+    cv2.HoughCircles/medianBlur más abajo. Esos parámetros NO son invariantes
+    a la escala: un blur de kernel fijo (3x3) es insignificante en una foto de
+    alta resolución (deja pasar grano/textura del papel que Hough puede
+    confundir con círculos), y los umbrales de Hough (param1/param2) fueron
+    ajustados para círculos de cierto tamaño en píxeles. Probado de forma
+    directa: la misma foto real reescalada a 4x resolución hizo caer la
+    exactitud de 100% a ~21%, con solo 4 de 80 preguntas resueltas con
+    confianza -- confirmando que el problema es de escala, no de la foto.
+
+    La solución: la GEOMETRÍA (dónde están las columnas, filas y burbujas) se
+    calcula siempre sobre una copia reescalada a un ancho de referencia fijo,
+    y esas coordenadas se escalan de vuelta a la resolución original antes de
+    MEDIR qué tan oscura está cada burbuja o de recortar una pregunta -- así
+    la medición real sigue usando el detalle completo de la foto original.
+    """
+    h, w = img_bgr.shape[:2]
+    if w <= ancho_referencia:
+        return img_bgr, 1.0
+    escala = ancho_referencia / w
+    img_esc = cv2.resize(img_bgr, (int(w * escala), int(h * escala)), interpolation=cv2.INTER_AREA)
+    return img_esc, escala
+
+
 def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
     """
     Punto de entrada principal del motor OMR: toma una imagen ya cargada (BGR,
     resolución original, SIN recomprimir) y devuelve la grilla ajustada +
     resultados crudos por pregunta local (orden banda por banda, 20 filas/banda).
+    Ver _omr_escalar_para_deteccion() para por qué la geometría se detecta a
+    una escala de referencia fija aunque la MEDICIÓN final use la foto entera
+    a resolución original.
 
     es_recorte=False: se asume hoja completa -> se localiza el bloque
       RESPUESTAS y se endereza antes de leer la grilla.
@@ -424,20 +485,39 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
     """
     img = img_bgr
     if not es_recorte:
-        quad = omr_detectar_bloque_respuestas(img)
+        img_det, escala_tabla = _omr_escalar_para_deteccion(img, OMR_ANCHO_REF_PAGINA)
+        quad = omr_detectar_bloque_respuestas(img_det)
         if quad is None:
             raise OMRError("No se pudo localizar el bloque RESPUESTAS en la hoja completa.")
-        img = omr_enderezar_region(img, quad)
+        if escala_tabla != 1.0:
+            quad = quad / escala_tabla  # coordenadas de vuelta a la resolución original
+        img = omr_enderezar_region(img, quad)  # perspective-warp sobre la imagen ORIGINAL, sin perder detalle
 
     bandas_esperadas = min(max_bandas, -(-n_preguntas // OMR_N_FILAS_POR_BLOQUE)) if n_preguntas else None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    header_bottom, bands = omr_detectar_header_y_bandas(
-        gray, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
+
+    # Referencia MUCHO más chica que la de arriba: acá "img" ya es solo la
+    # tabla RESPUESTAS (4 columnas de burbujas), no la hoja completa.
+    img_det, escala = _omr_escalar_para_deteccion(img, OMR_ANCHO_REF_TABLA)
+    gray_det = cv2.cvtColor(img_det, cv2.COLOR_BGR2GRAY)
+    header_bottom_det, bands_det = omr_detectar_header_y_bandas(
+        gray_det, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
         permitir_reparto_geometrico=not es_recorte)
+    body_gray_det = gray_det[header_bottom_det:, :]
+    y_centers_det, band_x_centers_det, radio_det = omr_ajustar_grilla(body_gray_det, bands_det)
+
+    # Escalar toda la geometría encontrada de vuelta a la resolución original
+    # antes de medir -- la medición de oscuridad y los recortes de preguntas
+    # SIEMPRE usan la foto a resolución completa, nunca la copia reescalada.
+    inv = 1.0 / escala
+    header_bottom = int(round(header_bottom_det * inv))
+    y_centers_por_banda = y_centers_det * inv
+    band_x_centers = band_x_centers_det * inv
+    radio = radio_det * inv
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     body_gray = gray[header_bottom:, :]
     body_bgr = img[header_bottom:, :]
 
-    y_centers_por_banda, band_x_centers, radio = omr_ajustar_grilla(body_gray, bands)
     scores = omr_calcular_puntajes(body_gray, y_centers_por_banda, band_x_centers, radio)
 
     # baseline/peak POR BANDA, no globales: tolera iluminación despareja entre
@@ -456,7 +536,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         "y_centers": y_centers_por_banda,
         "band_x_centers": band_x_centers,
         "radio": radio,
-        "n_bandas": len(bands),
+        "n_bandas": len(band_x_centers),
         "resultados": resultados,
     }
 
@@ -470,7 +550,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "3.0.0"
+VERSION_APP = "3.1.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
 
