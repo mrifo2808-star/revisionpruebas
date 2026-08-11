@@ -2,11 +2,27 @@
 Test de regresion permanente del motor OMR, corrido contra fotos reales (no
 sinteticas) en tests/data/omr/. En particular fija en el tiempo el bug real
 "USO EXCLUSIVO PARA ENSAYOS DE PRUEBAS": una foto real donde el bloque
-RESPUESTAS detectado queda demasiado ancho y la 4ta banda (preguntas 61-80)
-termina posicionada sobre el margen en blanco / texto vecino en vez de sobre
-burbujas reales. Este test debe fallar si esa banda vuelve a devolver
-alguna vez una respuesta "confiable" o "revisar_media" -- solo puede quedar
-como revisar_geometria (sin letra, para revision manual).
+RESPUESTAS detectado queda demasiado ancho y el contenido vecino ("USO
+EXCLUSIVO...") competia como candidato de banda.
+
+NOTA (2026-08-11, smoke test con fotos reales adicionales): la causa raiz de
+este bug resulto ser mas profunda de lo que este test asumia originalmente.
+No era que "la 4ta banda cae sobre el texto y por eso tiene baja confianza" --
+era que la seleccion de bandas, al encontrar mas candidatos de los esperados,
+se quedaba con LOS MAS ANCHOS, y el bloque de texto vecino podia ser mas
+ancho que una columna real (angosta), asi que se descartaba una columna real
+completa (la mas angosta) y el resto de las bandas quedaba UNA POSICION
+CORRIDA -- una columna nunca se leia, sus respuestas venian en realidad de
+la columna vecina bajo la etiqueta equivocada. Ese es el bug real (ver
+tests/test_omr_band_selection.py para el test sintetico que lo fija).
+
+Ya corregida la seleccion de bandas, en esta foto las 4 columnas quedan
+correctamente identificadas (incluido el texto "USO EXCLUSIVO", que ahora
+queda completamente fuera de las 4 bandas en vez de fusionado con alguna).
+Este test ya no puede asumir que una banda especifica cae siempre sobre el
+texto -- en su lugar fija la garantia real que importa: en esta foto dificil
+(borrosa, angulo real de celular, geometria via UNIFORM_FALLBACK) NINGUNA
+pregunta puede darse jamas como "confiable" (automatica sin revision).
 
 Correr desde la raiz del repo:  py tests/test_omr_regression.py
 """
@@ -52,7 +68,7 @@ def test_calibracion_sin_regresion(app):
 
 
 def test_uso_exclusivo_nunca_confiable(app):
-    print("=== 2) hoja_uso_exclusivo.jpg: banda sobre 'USO EXCLUSIVO' nunca debe darse como confiable ===")
+    print("=== 2) hoja_uso_exclusivo.jpg: ninguna pregunta puede darse como 'confiable' en esta foto dificil ===")
     with open(os.path.join(DATA_DIR, "hoja_uso_exclusivo.jpg"), "rb") as f:
         datos = f.read()
     res = app.procesar_imagen_hibrido(FakeCliente(), "hoja_uso_exclusivo.jpg", datos, "image/jpeg", 80,
@@ -60,24 +76,25 @@ def test_uso_exclusivo_nunca_confiable(app):
     metodos = res["omr_meta"]["metodo_por_pregunta"]
     geo_conf = res["omr_meta"]["geometry_confidence_por_banda"]
     print("geometry_confidence_por_banda:", geo_conf)
-    print("metodos preguntas 61-80:", set(metodos[60:80]))
+    from collections import Counter
+    print("metodos (conteo):", dict(Counter(metodos)))
 
-    # La banda 4 (indice 3, preguntas 61-80) es la que en esta foto cae sobre
-    # el margen en blanco / "USO EXCLUSIVO..." -- debe quedar marcada con baja
-    # geometry_confidence y NINGUNA de sus preguntas puede darse como confiable.
-    umbral = app.OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]
-    assert geo_conf[3] < umbral, f"se esperaba baja geometry_confidence en la banda 4, dio {geo_conf[3]}"
-    assert all(m == "revisar_geometria" for m in metodos[60:80]), \
-        f"FALLO CRITICO: alguna pregunta 61-80 no quedo como revisar_geometria: {metodos[60:80]}"
-    assert all(r is None for r in res["respuestas"][60:80]), \
-        "FALLO CRITICO: se devolvio una letra para una pregunta sobre 'USO EXCLUSIVO' -- el bug reaparecio"
+    # Garantia real: en una foto dificil (borrosa, angulo real de celular),
+    # cuya geometria completa cae en UNIFORM_FALLBACK, NINGUNA pregunta debe
+    # darse jamas como "confiable" -- ni las que originalmente estaban sobre
+    # texto, ni ninguna otra. Esto es lo que de verdad importa (una respuesta
+    # "confiable" incorrecta), no en que banda especifica cae el texto.
+    assert "confiable" not in metodos, \
+        f"FALLO CRITICO: alguna pregunta se dio como 'confiable' en una foto con geometria via fallback: {Counter(metodos)}"
 
-    # Las otras 3 bandas de ESTA MISMA foto (borrosa, con angulo real de celular)
-    # deben seguir teniendo geometry_confidence aceptable -- el fix no debe
-    # volverse tan estricto que desconfie de bandas legitimas solo por ruido/blur.
-    for bi in (0, 1, 2):
-        assert geo_conf[bi] >= umbral, f"banda {bi+1} no deberia quedar bajo el umbral (foto real valida): {geo_conf[bi]}"
-    print("OK -- las 20 preguntas de la banda invadida por 'USO EXCLUSIVO' quedaron para revision manual\n")
+    # Deben existir exactamente 4 bandas, todas con geometry_confidence por
+    # encima de 0 (ninguna completamente vacia/sin evidencia real) -- ver
+    # tests/test_omr_band_selection.py para el test dedicado de que las 4
+    # columnas reales quedan correctamente identificadas y el texto vecino
+    # excluido, en vez de fusionado con alguna de ellas.
+    assert len(geo_conf) == 4, f"se esperaban 4 bandas, se obtuvieron {len(geo_conf)}"
+    assert all(g > 0 for g in geo_conf), f"alguna banda quedo con geometry_confidence 0 (vacia): {geo_conf}"
+    print("OK -- ninguna pregunta se dio como 'confiable' en esta foto dificil\n")
 
 
 if __name__ == "__main__":

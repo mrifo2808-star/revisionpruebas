@@ -351,7 +351,31 @@ def omr_detectar_header_y_bandas(gray, max_bandas=OMR_MAX_BANDAS, bandas_esperad
             bands, mask = candidatas, mask_u
 
     if len(bands) > max_bandas:
-        bands = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:max_bandas]
+        # Encontrado con una foto real (smoke test fuera del repo): cuando el
+        # bloque RESPUESTAS detectado queda un poco ancho, el texto vecino
+        # ("USO EXCLUSIVO...") puede registrar suficiente tinta como para
+        # aparecer como un candidato de banda MÁS ANCHO que las columnas
+        # reales (que son angostas y uniformes entre sí). Quedarse con "los
+        # más anchos" -- la lógica anterior -- descarta entonces una columna
+        # real genuina (la más angosta del grupo) y conserva el bloque de
+        # texto espurio en su lugar: la banda resultante queda desplazada una
+        # posición completa (lo que el código llama "banda 3" termina siendo
+        # físicamente la columna 4, y "banda 4" el texto vecino) -- un
+        # desplazamiento de columna silencioso, sin relación con qué tan
+        # ancha es cada una individualmente.
+        #
+        # Las columnas reales de esta plantilla son angostas y muy uniformes
+        # entre sí (mismo layout impreso); un candidato espurio por contenido
+        # vecino tiende a ser un outlier de ancho, no simplemente "el más
+        # ancho de los reales". Por eso se conservan los `max_bandas`
+        # candidatos cuyo ancho está MÁS CERCA de la mediana del grupo
+        # completo -- esto descarta outliers en cualquier dirección (tanto
+        # ruido angosto como bloques anchos espurios) en vez de asumir que
+        # "ancho" siempre significa "real".
+        anchos_cand = np.array([b[1] - b[0] for b in bands], dtype=np.float64)
+        mediana_cand = float(np.median(anchos_cand))
+        orden_cercania = np.argsort(np.abs(anchos_cand - mediana_cand))
+        bands = [bands[i] for i in orden_cercania[:max_bandas]]
         bands = sorted(bands, key=lambda b: b[0])
 
     bandas_fabricadas = False
@@ -894,14 +918,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSION_APP = "3.2.0"
+VERSION_APP = "4.0.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
-# Identifica el estado del motor OMR dentro de esta rama de desarrollo
-# (fix/omr-generalization), SIN simular una versión de producción que
-# todavía no está desplegada -- VERSION_APP se mantiene en 3.2.0 (igual que
-# main) hasta que esta rama se fusione de verdad.
-OMR_ENGINE_VERSION = "4.0-rc1"
+# Motor OMR v4: geometry_confidence + geometry_state (OK/WARNING/ERROR) +
+# geometry_source trazable (HOUGH/UNIFORM_FALLBACK/GEOMETRIC_BAND_FALLBACK)
+# por banda, fail-closed en la localización de la tabla y en la selección de
+# bandas (nunca se acepta una columna real más angosta a cambio de un
+# candidato espurio más ancho), y arbitraje de IA para respuestas ambiguas
+# apagado por defecto. Validado contra fixtures + smoke test con fotos
+# reales adicionales (privado, fuera del repo) antes de fusionar a main.
+OMR_ENGINE_VERSION = "4.0.0"
 
 st.markdown("""
 <style>
@@ -1945,7 +1972,7 @@ with st.sidebar:
             "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
         })
         st.rerun()
-    st.caption(f"Versión {VERSION_APP} · Actualizado {FECHA_ACTUALIZACION}")
+    st.caption(f"Versión {VERSION_APP} · OMR {OMR_ENGINE_VERSION} · Actualizado {FECHA_ACTUALIZACION}")
     st.caption(f"Desarrollado por {DESARROLLADO_POR}")
 
 
