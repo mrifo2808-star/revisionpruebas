@@ -486,6 +486,13 @@ with tab_cargar:
         if agregadas:
             st.rerun()
 
+    # Mensaje del último procesamiento: se guarda en session_state porque el
+    # st.rerun() de más abajo redibuja la pantalla de inmediato y borraría un
+    # st.success/st.error mostrado en la misma corrida antes de que se alcance a leer.
+    if st.session_state.get("mensaje_proceso"):
+        tipo, texto = st.session_state.pop("mensaje_proceso")
+        (st.error if tipo == "error" else st.success)(texto)
+
     pendientes = st.session_state.fotos_pendientes
     total_proc = len(st.session_state.resultados)
 
@@ -518,8 +525,10 @@ with tab_cargar:
                 except Exception as e:
                     errs.append(f"{foto['nombre']}: {e} — quedó en la cola, reintenta.")
             prog.progress(1.0, text="¡Completado!")
-            if errs: st.error("Errores:\n"+"\n".join(errs))
-            else: st.success(f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
+            if errs:
+                st.session_state["mensaje_proceso"] = ("error", "Errores:\n"+"\n".join(errs))
+            else:
+                st.session_state["mensaje_proceso"] = ("success", f"✅ {len(items)} procesadas. Ve a **Revisar y corregir**.")
             st.rerun()
     elif total_proc:
         st.success("✅ Todas las fotos cargadas. Ve a **Revisar y corregir**.")
