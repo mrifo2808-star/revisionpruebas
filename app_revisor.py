@@ -90,6 +90,9 @@ OMR_THRESHOLDS = {
     "HIGH_CONFIDENCE_MARGIN": 0.30,  # margen a partir del cual se usa directo, sin marcar dudosa
     "DOUBLE_MARK_THRESHOLD": 0.55,   # si dos alternativas superan esto, se considera "doble marca"
     "BLANK_REVIEW_MARGIN": 0.12,     # "sin_marca" por encima de esto = posible marca débil, queda dudosa
+    "MIN_GEOMETRY_CONFIDENCE": 0.5,  # por debajo de esto, la banda no tiene evidencia real de ser
+                                      # una grilla de burbujas (pudo caer sobre texto/margen vecino) --
+                                      # ninguna pregunta de esa banda puede darse como confiable
 }
 OMR_N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual que usa el prompt de Claude)
 OMR_LETRAS = ["A", "B", "C", "D", "E"]
@@ -320,10 +323,33 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
     """Ajusta, PARA CADA BANDA POR SEPARADO, sus 20 centros de fila y sus 5 centros
     de columna, usando detección de círculos (Hough) + kmeans 1D. Si Hough no
     encuentra suficientes círculos en una banda puntual, esa banda cae a una
-    grilla uniforme por proporciones — las demás siguen con su ajuste por círculos."""
+    grilla uniforme por proporciones -- las demás siguen con su ajuste por círculos.
+
+    También devuelve, por banda, una geometry_confidence en [0, 1] con dos señales
+    independientes:
+
+    1. Consistencia de ancho entre bandas -- las 4 bandas del mismo formulario
+       tienen el mismo layout impreso (20 filas x 5 letras), así que deberían
+       medir aproximadamente lo mismo de ancho. Si el bloque RESPUESTAS
+       detectado quedó demasiado ancho y una banda absorbió de más el margen en
+       blanco o texto vecino ("USO EXCLUSIVO..."), esa banda va a ser notoriamente
+       más ancha que sus hermanas -- una señal geométrica pura, independiente de
+       la nitidez de la foto, que no necesita OCR para detectar el problema.
+    2. Un piso mínimo de círculos Hough reales encontrados en la banda: si no hay
+       PRÁCTICAMENTE NINGUNO (banda vacía de verdad, ej. una columna que la foto
+       ni siquiera llegó a mostrar), no importa que el ancho sea consistente --
+       ahí no hay nada que leer.
+
+    Una foto borrosa/comprimida baja el conteo total de círculos que Hough logra
+    encontrar en TODAS las bandas por igual (ninguna razón para desconfiar más de
+    una banda que de otra por eso), así que el conteo de Hough se usa solo como
+    piso de "banda completamente vacía", no como score graduado -- el score
+    graduado real es la consistencia de ancho entre bandas hermanas."""
     bh, bw = body_gray.shape
     blur = cv2.medianBlur(body_gray, 3)
-    min_band_w = min(x1 - x0 for x0, x1 in bands)
+    anchos = [x1 - x0 for x0, x1 in bands]
+    min_band_w = min(anchos)
+    ancho_mediano = float(np.median(anchos))
     r_guess = max(3, min_band_w // 12)
     circles = cv2.HoughCircles(
         blur, cv2.HOUGH_GRADIENT, dp=1, minDist=max(4, r_guess),
@@ -331,10 +357,14 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
         maxRadius=int(r_guess * 1.8),
     )
     pts = circles[0] if circles is not None else np.empty((0, 3))
+    esperados = 5 * n_filas
 
-    y_centers_por_banda, band_x_centers, radios = [], [], []
+    y_centers_por_banda, band_x_centers, radios, geometry_confidence = [], [], [], []
     for (x0, x1) in bands:
         sel = pts[(pts[:, 0] >= x0) & (pts[:, 0] < x1)]
+        ancho_conf = min(x1 - x0, ancho_mediano) / max(x1 - x0, ancho_mediano, 1e-6)
+        banda_vacia = len(sel) < max(3, esperados * 0.03)  # casi ningún círculo real -> no hay grilla ahí
+        geometry_confidence.append(0.0 if banda_vacia else ancho_conf)
         if len(sel) >= max(5 * n_filas * 0.35, 10):
             y_centers_por_banda.append(_omr_kmeans_1d(sel[:, 1], n_filas))
             band_x_centers.append(_omr_kmeans_1d(sel[:, 0], 5))
@@ -348,7 +378,7 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE):
             radios.append(max(3.0, min_band_w * 0.08))
 
     radio = float(np.median(radios))
-    return np.array(y_centers_por_banda), np.array(band_x_centers), radio
+    return np.array(y_centers_por_banda), np.array(band_x_centers), radio, geometry_confidence
 
 
 def _omr_oscuridad_celda(gray, cx, cy, r):
@@ -426,6 +456,7 @@ OMR_COLOR_MEDIA = (0, 200, 230)     # amarillo/naranjo
 OMR_COLOR_AMBIGUA = (40, 40, 220)   # rojo
 OMR_COLOR_BLANCO = (150, 150, 150)  # gris (sin marca, con confianza suficiente para no ser dudosa)
 OMR_COLOR_IA = (200, 130, 0)        # azul (resuelta por la IA de apoyo tras quedar ambigua en el OMR)
+OMR_COLOR_GEOMETRIA = (180, 0, 180)  # magenta (sin evidencia de grilla real -- posible zona equivocada)
 
 
 def omr_anotar_diagnostico(body_bgr, y_centers_por_banda, band_x_centers, radio, resultados,
@@ -449,7 +480,7 @@ def omr_anotar_diagnostico(body_bgr, y_centers_por_banda, band_x_centers, radio,
             "alta_confianza": OMR_COLOR_ALTA, "confianza_media": OMR_COLOR_MEDIA, "sin_marca": OMR_COLOR_BLANCO,
             "confiable": OMR_COLOR_ALTA, "revisar_media": OMR_COLOR_MEDIA,
             "revisar_dudoso": OMR_COLOR_AMBIGUA, "blanco": OMR_COLOR_BLANCO,
-            "revisada_ia": OMR_COLOR_IA,
+            "revisada_ia": OMR_COLOR_IA, "revisar_geometria": OMR_COLOR_GEOMETRIA, "geometry_error": OMR_COLOR_GEOMETRIA,
         }.get(status, OMR_COLOR_AMBIGUA)
         if r["letra"]:
             li = OMR_LETRAS.index(r["letra"])
@@ -548,7 +579,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         gray_det, max_bandas=max_bandas, bandas_esperadas=bandas_esperadas,
         permitir_reparto_geometrico=not es_recorte)
     body_gray_det = gray_det[header_bottom_det:, :]
-    y_centers_det, band_x_centers_det, radio_det = omr_ajustar_grilla(body_gray_det, bands_det)
+    y_centers_det, band_x_centers_det, radio_det, geometry_confidence = omr_ajustar_grilla(body_gray_det, bands_det)
 
     # Escalar toda la geometría encontrada de vuelta a la resolución original
     # antes de medir -- la medición de oscuridad y los recortes de preguntas
@@ -574,7 +605,20 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         banda_vals = np.array([v for s in banda_scores for v in s.values()])
         baseline = float(np.percentile(banda_vals, 15))
         peak = float(np.percentile(banda_vals, 97))
-        resultados.extend(omr_clasificar_pregunta(s, baseline, peak) for s in banda_scores)
+        geo_conf = geometry_confidence[bi]
+        for s in banda_scores:
+            r = omr_clasificar_pregunta(s, baseline, peak)
+            r["geometry_confidence"] = round(geo_conf, 3)
+            if geo_conf < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]:
+                # Sin evidencia real (círculos Hough) de que esta banda sea una
+                # grilla de burbujas -- pudo caer sobre margen en blanco o texto
+                # vecino. No importa qué tan "clara" parezca la marca: medir
+                # oscuridad sobre la zona equivocada puede dar una lectura con
+                # apariencia de alta confianza pero completamente falsa. Se
+                # fuerza a revisión manual en vez de devolver una letra.
+                r["letra"] = None
+                r["status"] = "geometry_error"
+            resultados.append(r)
 
     return {
         "body_bgr": body_bgr,
@@ -582,6 +626,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=4, n_preguntas=None):
         "band_x_centers": band_x_centers,
         "radio": radio,
         "n_bandas": len(band_x_centers),
+        "geometry_confidence_por_banda": [round(g, 3) for g in geometry_confidence],
         "resultados": resultados,
     }
 
@@ -1207,6 +1252,15 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
             dudosas.append(q)
         elif status == "sin_marca" and r["omr_confidence"] <= umbral_blanco:
             metodo = "blanco"  # sin tinta suficiente ni para dudar: se confía en que está en blanco
+        elif status == "geometry_error":
+            # la banda de esta pregunta no tiene evidencia real (círculos Hough)
+            # de ser una grilla de burbujas -- posiblemente cayó sobre margen en
+            # blanco o texto vecino. No se manda a arbitraje de IA: un recorte de
+            # esa zona no muestra una fila de alternativas real, así que pedirle
+            # a Claude que elija una letra ahí solo arriesgaría inventar una.
+            metodo = "revisar_geometria"
+            letra = None
+            dudosas.append(q)
         else:
             # ambiguo, doble_marca, o "sin_marca" con tinta suficiente para
             # sospechar una marca muy débil -> el motor no adivina; se intenta
@@ -1266,6 +1320,8 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
             "confianza_por_pregunta": confianza_por_pregunta,
             "n_confiable": sum(1 for m in metodo_por_pregunta if m in ("confiable", "blanco")),
             "n_dudosas": len(dudosas),
+            "geometry_confidence_por_banda": salida.get("geometry_confidence_por_banda", []),
+            "n_geometry_error": sum(1 for m in metodo_por_pregunta if m == "revisar_geometria"),
         },
     }
 
@@ -1835,9 +1891,15 @@ with tab_revisar:
                     pct_omr = round(omr_meta["n_confiable"] / n_total * 100) if n_total else 0
                     st.caption(f"🔬 **{pct_omr}%** confiable ({omr_meta['n_confiable']}/{n_total}) · "
                                f"{omr_meta['n_dudosas']} para revisar abajo")
+                    if omr_meta.get("n_geometry_error"):
+                        bandas_bajas = [i + 1 for i, g in enumerate(omr_meta.get("geometry_confidence_por_banda", []))
+                                        if g < OMR_THRESHOLDS["MIN_GEOMETRY_CONFIDENCE"]]
+                        st.warning(f"🟣 {omr_meta['n_geometry_error']} pregunta(s) en la(s) columna(s) {bandas_bajas} "
+                                   "no tienen evidencia de estar sobre burbujas reales (posible margen/texto vecino "
+                                   "capturado de más) — quedaron para revisión manual, no se adivinaron.")
                     if datos_orig.get("omr_diagnostico_bytes"):
                         with st.expander("🔬 Ver diagnóstico OMR"):
-                            st.caption("🟢 confiable · 🟡 confianza media · 🔵 resuelta por IA · 🔴 dudosa · ⚪ en blanco")
+                            st.caption("🟢 confiable · 🟡 confianza media · 🔵 resuelta por IA · 🟣 sin evidencia de grilla · 🔴 dudosa · ⚪ en blanco")
                             st.image(datos_orig["omr_diagnostico_bytes"], use_container_width=True)
                 elif omr_meta and not omr_meta.get("usado"):
                     st.error(f"🔬 No se pudo leer con OMR ({omr_meta.get('motivo_fallback','?')}). "

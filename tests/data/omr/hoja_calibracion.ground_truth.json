@@ -1,0 +1,16 @@
+{
+  "imagen": "hoja_calibracion.png",
+  "modo": "completa",
+  "n_preguntas": 80,
+  "nota": "Ground truth = lo que el estudiante marco fisicamente en la hoja (verificado a mano), no la respuesta academicamente correcta. Preguntas en null quedaron genuinamente en blanco o ilegibles en la foto original.",
+  "respuestas": {
+    "1": "C", "2": "D", "3": "A", "4": "D", "5": "C", "6": "B", "7": "B", "8": "D", "9": "C", "10": "A",
+    "11": "B", "12": "A", "13": "B", "14": "B", "15": "A", "16": "D", "17": "D", "18": "D", "19": "D", "20": "B",
+    "21": "A", "22": "C", "23": "A", "24": "C", "25": "B", "26": "C", "27": "D", "28": "D", "29": "A", "30": "A",
+    "31": "C", "32": "C", "33": "B", "34": null, "35": "D", "36": "B", "37": "A", "38": "C", "39": "B", "40": "A",
+    "41": "B", "42": "B", "43": "A", "44": "C", "45": "D", "46": "C", "47": "C", "48": "A", "49": "B", "50": "B",
+    "51": "B", "52": "B", "53": "A", "54": "C", "55": "B", "56": "D", "57": "B", "58": "D", "59": "B", "60": "A",
+    "61": "D", "62": "C", "63": "C", "64": "D", "65": "C", "66": null, "67": null, "68": null, "69": null, "70": null,
+    "71": null, "72": null, "73": null, "74": null, "75": null, "76": null, "77": null, "78": null, "79": null, "80": null
+  }
+}
