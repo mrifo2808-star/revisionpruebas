@@ -29,6 +29,15 @@ Anthropic -- nunca committeadas al repo, .streamlit/secrets.toml está en
     client_id = "..."
     token_uri = "https://oauth2.googleapis.com/token"
 
+Además (para "recordarme" en el login, ver app_revisor.py):
+
+    AUTH_COOKIE_SECRET = "una-cadena-larga-y-aleatoria-cualquiera"
+
+Sin AUTH_COOKIE_SECRET, "recordarme" queda deshabilitado sin romper el login
+normal (fail-closed) -- generarla una sola vez, p.ej. con
+`python -c "import secrets; print(secrets.token_hex(32))"`, y no cambiarla
+después salvo que se quiera invalidar todas las sesiones recordadas activas.
+
 La planilla debe tener dos pestañas con estos encabezados exactos (fila 1):
 
     usuarios: usuario | password_hash | nombre | rol | activo
@@ -111,13 +120,11 @@ def _validar_fila_login(fila: dict, password: str) -> dict | None:
     }
 
 
-def verificar_login(usuario: str, password: str) -> dict | None:
-    """Devuelve {"usuario", "nombre", "rol"} si las credenciales son válidas
-    y la cuenta está activa, o None en cualquier otro caso -- incluida una
-    falla al leer Sheets (fail-closed: sin poder confirmar la credencial,
-    no hay acceso)."""
-    if not usuario or not password:
-        return None
+def _buscar_fila_usuario(usuario: str) -> dict | None:
+    """Lee la pestaña usuarios y devuelve la fila cruda de ese usuario (o
+    None si no existe o hay un error de lectura) -- compartida entre
+    verificar_login (exige password) y obtener_usuario_activo (revalida una
+    sesión ya recordada, sin password)."""
     try:
         filas = _leer_usuarios()
     except Exception as e:
@@ -126,8 +133,41 @@ def verificar_login(usuario: str, password: str) -> dict | None:
     usuario_norm = usuario.strip().lower()
     for fila in filas:
         if str(fila.get("usuario", "")).strip().lower() == usuario_norm:
-            return _validar_fila_login(fila, password)
+            return fila
     return None
+
+
+def verificar_login(usuario: str, password: str) -> dict | None:
+    """Devuelve {"usuario", "nombre", "rol"} si las credenciales son válidas
+    y la cuenta está activa, o None en cualquier otro caso -- incluida una
+    falla al leer Sheets (fail-closed: sin poder confirmar la credencial,
+    no hay acceso)."""
+    if not usuario or not password:
+        return None
+    fila = _buscar_fila_usuario(usuario)
+    return _validar_fila_login(fila, password) if fila else None
+
+
+def obtener_usuario_activo(usuario: str) -> dict | None:
+    """Devuelve {"usuario", "nombre", "rol"} si el usuario existe y sigue
+    activo, SIN verificar clave -- usado solo para revalidar un token de
+    'recordarme' ya firmado (nunca para un login directo, que siempre exige
+    password vía verificar_login). Mismo criterio fail-closed: cuenta
+    desactivada o error de lectura -> sin acceso, aunque el token en sí
+    siga siendo una firma válida."""
+    if not usuario:
+        return None
+    fila = _buscar_fila_usuario(usuario)
+    if not fila:
+        return None
+    activo = str(fila.get("activo", "")).strip().upper() in _ACTIVO_VALORES_TRUE
+    if not activo:
+        return None
+    return {
+        "usuario": fila.get("usuario"),
+        "nombre": fila.get("nombre") or fila.get("usuario"),
+        "rol": fila.get("rol") or "docente",
+    }
 
 
 def registrar_evento(usuario: str, evento: str, **detalle) -> None:

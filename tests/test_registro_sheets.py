@@ -132,6 +132,48 @@ def test_registrar_evento_login_sin_detalle_no_lanza(monkeypatch):
     print("OK\n")
 
 
+# ─── obtener_usuario_activo (revalida una sesión "recordada", sin password) ───
+
+def test_obtener_usuario_activo_devuelve_datos_sin_pedir_clave(monkeypatch):
+    print("=== obtener_usuario_activo: usuario activo -> datos de sesion, sin verificar ninguna clave ===")
+    monkeypatch.setattr(rs, "_leer_usuarios", lambda: [_fila()])
+    assert rs.obtener_usuario_activo("ana") == {"usuario": "ana", "nombre": "Ana Soto", "rol": "docente"}
+    print("OK\n")
+
+
+def test_obtener_usuario_activo_cuenta_desactivada(monkeypatch):
+    print("=== obtener_usuario_activo: cuenta desactivada mientras el token seguia vigente -> None ===")
+    monkeypatch.setattr(rs, "_leer_usuarios", lambda: [_fila(activo="FALSE")])
+    assert rs.obtener_usuario_activo("ana") is None
+    print("OK\n")
+
+
+def test_obtener_usuario_activo_usuario_no_existe(monkeypatch):
+    print("=== obtener_usuario_activo: usuario que ya no esta en la planilla -> None ===")
+    monkeypatch.setattr(rs, "_leer_usuarios", lambda: [_fila(usuario="otro")])
+    assert rs.obtener_usuario_activo("ana") is None
+    print("OK\n")
+
+
+def test_obtener_usuario_activo_falla_cerrado_si_sheets_falla(monkeypatch):
+    print("=== obtener_usuario_activo: FALLA CERRADO -- si no se puede leer Sheets, no hay acceso ===")
+    def _explota():
+        raise RuntimeError("Sheets no disponible")
+    monkeypatch.setattr(rs, "_leer_usuarios", lambda: _explota())
+    assert rs.obtener_usuario_activo("ana") is None
+    print("OK\n")
+
+
+def test_obtener_usuario_activo_usuario_vacio(monkeypatch):
+    print("=== obtener_usuario_activo: usuario vacio -> None sin tocar Sheets ===")
+    llamadas = []
+    monkeypatch.setattr(rs, "_leer_usuarios", lambda: llamadas.append(1) or [])
+    assert rs.obtener_usuario_activo("") is None
+    assert rs.obtener_usuario_activo(None) is None
+    assert llamadas == [], "no deberia leer Sheets si el usuario viene vacio"
+    print("OK\n")
+
+
 if __name__ == "__main__":
     test_validar_fila_login_credenciales_correctas()
     test_validar_fila_login_clave_incorrecta()

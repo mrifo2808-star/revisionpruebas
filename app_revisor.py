@@ -11,6 +11,8 @@ import json
 import re
 import base64
 import hashlib
+import hmac
+import time
 from collections import Counter
 import qrcode
 import pandas as pd
@@ -22,6 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+from streamlit_cookies_controller import CookieController
 
 # Motor OMR (opcional): si opencv/numpy no están disponibles en el entorno de
 # despliegue, la app sigue funcionando 100% igual que antes con el flujo solo-IA
@@ -3303,6 +3306,64 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ─── "Recordarme" (sesión persistente entre visitas) ──────────────────────
+# st.session_state por sí solo se pierde en cada recarga de página, pestaña
+# nueva o reinicio del contenedor de Streamlit Cloud tras dormir por
+# inactividad -- por eso antes de esto la app pedía usuario/clave en CADA
+# visita, no solo tras cerrar sesión de verdad. La cookie NUNCA guarda la
+# clave: guarda un token firmado (HMAC-SHA256) con el usuario + fecha de
+# expiración, firmado con un secreto del servidor (AUTH_COOKIE_SECRET en
+# st.secrets, nunca en el repo). Sin ese secreto configurado, "recordarme"
+# queda deshabilitado sin romper el login normal (fail-closed: sin poder
+# firmar/verificar, no se persiste ni se confía en nada).
+AUTH_COOKIE_NOMBRE = "hd_recordar"
+AUTH_COOKIE_DIAS = 30
+
+
+def _secreto_cookie_auth() -> str:
+    try:
+        return st.secrets.get("AUTH_COOKIE_SECRET", "")
+    except Exception:
+        return ""
+
+
+def _generar_token_recordar(usuario: str, secreto: str, dias: int = AUTH_COOKIE_DIAS):
+    """Token firmado para 'recordarme': `payload_b64.firma_hmac`, donde
+    payload es "usuario|expira_epoch". Nunca contiene la clave -- separada
+    de dónde sale el secreto (ver _secreto_cookie_auth) para poder probar la
+    firma/verificación sin necesitar st.secrets (mismo patrón que
+    verificar_login/_validar_fila_login en registro_sheets.py)."""
+    if not secreto or not usuario:
+        return None
+    expira = int(time.time()) + dias * 86400
+    payload = base64.urlsafe_b64encode(f"{usuario}|{expira}".encode("utf-8")).decode("ascii")
+    firma = hmac.new(secreto.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{firma}"
+
+
+def _validar_token_recordar(token: str, secreto: str):
+    """Devuelve el usuario si el token es una firma válida y no expiró, o
+    None ante cualquier problema (token ajeno, secreto rotado, expirado,
+    formato inválido) -- nunca lanza excepción, un token malo se trata
+    igual que "no hay cookie"."""
+    if not secreto or not token or "." not in token:
+        return None
+    payload, _, firma = token.partition(".")
+    firma_esperada = hmac.new(secreto.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(firma, firma_esperada):
+        return None
+    try:
+        usuario, expira_s = base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8").rsplit("|", 1)
+        expira = int(expira_s)
+    except Exception:
+        return None
+    if expira < int(time.time()):
+        return None
+    return usuario
+
+
+_cookies = CookieController(key="auth_cookies")
+
 
 def _render_login():
     """Formulario de acceso -- grupo cerrado, cuentas precargadas por el
@@ -3314,16 +3375,36 @@ def _render_login():
     with st.form("form_login"):
         usuario = st.text_input("Usuario")
         password = st.text_input("Clave", type="password")
+        recordar = st.checkbox(f"Recordarme en este dispositivo ({AUTH_COOKIE_DIAS} días)", value=True)
         enviado = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
     if enviado:
         datos = registro_sheets.verificar_login(usuario, password)
         if datos:
             st.session_state["auth_usuario"] = datos
             registro_sheets.registrar_evento(datos["usuario"], "login")
+            if recordar:
+                token = _generar_token_recordar(datos["usuario"], _secreto_cookie_auth())
+                if token:
+                    _cookies.set(AUTH_COOKIE_NOMBRE, token, max_age=AUTH_COOKIE_DIAS * 86400)
             st.rerun()
         else:
             st.error("Usuario o clave incorrectos.")
 
+
+if not st.session_state.get("auth_usuario"):
+    # Antes de pedir usuario/clave, revisar si ya hay una sesión recordada
+    # válida en este navegador -- revalida el usuario contra Sheets (nunca
+    # confía ciegamente en el token: si la cuenta fue desactivada mientras
+    # tanto, sigue fallando cerrado igual que un login manual).
+    _token_guardado = _cookies.get(AUTH_COOKIE_NOMBRE)
+    _usuario_recordado = _validar_token_recordar(_token_guardado, _secreto_cookie_auth()) if _token_guardado else None
+    if _usuario_recordado:
+        _datos_recordados = registro_sheets.obtener_usuario_activo(_usuario_recordado)
+        if _datos_recordados:
+            st.session_state["auth_usuario"] = _datos_recordados
+            registro_sheets.registrar_evento(_datos_recordados["usuario"], "login_recordado")
+        else:
+            _cookies.remove(AUTH_COOKIE_NOMBRE)
 
 if not st.session_state.get("auth_usuario"):
     _render_login()
@@ -3334,6 +3415,7 @@ with st.sidebar:
     st.markdown(f"👤 **{_auth['nombre']}**")
     if st.button("Cerrar sesión", use_container_width=True):
         del st.session_state["auth_usuario"]
+        _cookies.remove(AUTH_COOKIE_NOMBRE)
         st.rerun()
     st.markdown("---")
 
