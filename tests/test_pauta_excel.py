@@ -129,6 +129,35 @@ def test_reconoce_nombres_de_columna_alternativos(funcs):
     print("OK\n")
 
 
+def test_columna_desconocida_falla_cerrado_no_adivina(funcs):
+    print("=== FAIL-CLOSED: sin columna reconocible, NO se asume la ultima columna (antes df.columns[-1]) ===")
+    n = 4
+    datos = _wb_con_respuestas(["A", "B", "C", "D"], header=("Pregunta", "ColumnaRara"))
+    pauta, avisos = funcs["pauta_desde_excel_bytes"](datos, n)
+    assert pauta == [None] * n
+    assert any("no se encontr" in a.lower() for a in avisos)
+    assert any("respuesta" in a.lower() and "alternativa" in a.lower() for a in avisos), \
+        "el aviso debe listar los nombres de columna aceptados"
+    print("OK\n")
+
+
+def test_multiples_columnas_irrelevantes_no_adivina(funcs):
+    print("=== varias columnas irrelevantes, ninguna reconocible -- no se adivina cual usar ===")
+    n = 3
+    wb = Workbook()
+    ws = wb.active
+    ws.cell(1, 1, "ID"); ws.cell(1, 2, "Comentario"); ws.cell(1, 3, "Fecha")
+    for i, (a, b, c) in enumerate([("1", "ok", "2026-01-01"), ("2", "revisar", "2026-01-02"),
+                                     ("3", "listo", "2026-01-03")]):
+        ws.cell(i + 2, 1, a); ws.cell(i + 2, 2, b); ws.cell(i + 2, 3, c)
+    buf = io.BytesIO()
+    wb.save(buf)
+    pauta, avisos = funcs["pauta_desde_excel_bytes"](buf.getvalue(), n)
+    assert pauta == [None] * n
+    assert avisos
+    print("OK\n")
+
+
 def test_archivo_vacio_no_crashea(funcs):
     print("=== un Excel sin filas de datos no debe lanzar excepcion, solo devolver una pauta vacia con aviso ===")
     n = 5
@@ -180,6 +209,8 @@ if __name__ == "__main__":
     test_menos_filas_que_n_completa_con_none(ns)
     test_mas_filas_que_n_se_recorta(ns)
     test_reconoce_nombres_de_columna_alternativos(ns)
+    test_columna_desconocida_falla_cerrado_no_adivina(ns)
+    test_multiples_columnas_irrelevantes_no_adivina(ns)
     test_archivo_vacio_no_crashea(ns)
     test_archivo_no_excel_no_crashea(ns)
     test_plantilla_tiene_validacion_de_datos_a_e(ns)

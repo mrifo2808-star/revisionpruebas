@@ -1967,9 +1967,27 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
 # ═══════════════════════ fin motor OMR ═══════════════════════════════════
 
 
-VERSION_APP = "4.2.0"
+VERSION_APP = "4.3.0"
 FECHA_ACTUALIZACION = "2026-08-11"
 DESARROLLADO_POR = "Matías Rifo V."
+# v4.3.0 (CIERRE TÉCNICO 11-08-2026): integra en una sola versión el trabajo
+# de la jornada -- "recordarme" (sesión persistente vía cookie firmada
+# HMAC-SHA256, ver sección "Recordarme" más abajo) y carga de pauta desde
+# Excel (pauta_desde_excel_bytes) ya estaban en main sin haber avanzado
+# VERSION_APP; este cierre además corrige riesgos concretos detectados en
+# ambas: pauta_desde_excel_bytes pasa a FAIL-CLOSED (ya no asume
+# df.columns[-1] si no reconoce el nombre de la columna), "Importar rápido"
+# deja de extraer letras A-E sueltas desde palabras arbitrarias
+# (extraer_letras_pauta_rapida exige límite de palabra), el checkbox
+# "Recordarme" pasa a value=False por defecto, la cookie se fija con
+# secure=True/same_site="strict" (streamlit-cookies-controller no soporta
+# HttpOnly -- riesgo residual documentado en docs/CIERRE_2026-08-11.md), y el
+# login suma una mitigación básica de fuerza bruta (contador en
+# session_state, ver LOGIN_MAX_INTENTOS). registro_sheets.py pasa a
+# value_input_option="RAW" en vez de "USER_ENTERED" para que Sheets nunca
+# interprete texto de usuario como fórmula. Se integra también
+# fix/omr-row-index-consensus-v42 (ver OMR_ENGINE_VERSION 4.2.0 más abajo,
+# que ya traía ese bump) y se agrega CI (.github/workflows/tests.yml).
 # v4.2.0 (LOGIN + REGISTRO DE ACTIVIDAD): la plataforma pasa a requerir
 # inicio de sesión -- grupo cerrado de cuentas precargadas por el
 # administrador (ver gestionar_usuarios.py), sin auto-registro público. Cada
@@ -2074,6 +2092,21 @@ div[data-testid="stFileUploader"] > div { min-height: 120px; }
 """, unsafe_allow_html=True)
 
 # ─── Estado de sesión ────────────────────────────────────────────────
+def extraer_letras_pauta_rapida(texto: str) -> list:
+    """Extrae letras A-E de "Importar rápido" (pauta pegada como texto
+    libre). Solo cuenta un token A/B/C/D/E "claramente identificable" --
+    una letra rodeada por límites de palabra (\\b), es decir separada por
+    espacio, salto de línea, coma, paréntesis, "=", inicio/fin de texto,
+    etc. -- NUNCA una letra que forme parte de una palabra más larga (p.ej.
+    la "a" de "Alternativa" o "ABCDEtexto" pegado). Acepta formatos reales
+    como "A", "A,B,C,D", "A B C D", "1 A" / "2 B" (número + letra) y
+    "P1=A" / "P2=B", porque en todos esos casos la letra queda aislada por
+    un separador; nunca inventa una pauta a partir de texto narrativo."""
+    if not texto:
+        return []
+    return re.findall(r'\b[A-Ea-e]\b', texto)
+
+
 def df_pauta_vacio(n: int) -> pd.DataFrame:
     return pd.DataFrame({
         "N°": [f"P{i}" for i in range(1, n + 1)],
@@ -2903,7 +2936,14 @@ def pauta_desde_excel_bytes(datos: bytes, n: int) -> tuple:
     siempre de largo n, igual que pauta_desde_df, para poder cargarla directo
     en pauta_df sin tocar el resto del flujo. avisos son mensajes para
     mostrar en la UI (nunca excepciones: un Excel mal formado se trata como
-    "no se encontraron respuestas", no como un crash)."""
+    "no se encontraron respuestas", no como un crash).
+
+    FAIL-CLOSED: la pauta define la corrección académica, así que si ninguna
+    columna tiene un nombre reconocible NO se adivina (antes se asumía la
+    última columna del archivo, demasiado permisivo) -- se devuelve una
+    pauta vacía y un aviso explícito con los nombres aceptados, para que la
+    persona usuaria corrija el encabezado en vez de confiar en un archivo
+    ambiguo."""
     avisos = []
     try:
         df = pd.read_excel(io.BytesIO(datos))
@@ -2913,7 +2953,13 @@ def pauta_desde_excel_bytes(datos: bytes, n: int) -> tuple:
         return [None] * n, ["El archivo está vacío."]
 
     candidatos = {"respuesta", "alternativa", "correcta", "pauta", "clave"}
-    col_resp = next((c for c in df.columns if str(c).strip().lower() in candidatos), df.columns[-1])
+    col_resp = next((c for c in df.columns if str(c).strip().lower() in candidatos), None)
+    if col_resp is None:
+        return [None] * n, [
+            "No se encontró una columna de respuesta reconocible -- se esperaba una "
+            "columna llamada Respuesta, Alternativa, Correcta, Pauta o Clave. "
+            "No se cargó ninguna respuesta."
+        ]
     valores = df[col_resp].tolist()
 
     if len(valores) != n:
@@ -3213,7 +3259,7 @@ def render_revisor_pruebas():
             texto_bulk = st.text_area("Importar", height=200, label_visibility="collapsed",
                 placeholder=f"A\nB\nC\n...\no bien: A,B,C,D,E,...\n({n} respuestas)")
             if st.button("⬇️ Cargar al grid", use_container_width=True):
-                letras=[l.upper() for l in re.findall(r'[AaBbCcDdEe]', texto_bulk)]
+                letras = [l.upper() for l in extraer_letras_pauta_rapida(texto_bulk)]
                 if letras:
                     st.session_state["pauta_df"] = pd.DataFrame({
                         "N°":[f"P{i}" for i in range(1,n+1)],
@@ -3726,6 +3772,20 @@ st.set_page_config(
 AUTH_COOKIE_NOMBRE = "hd_recordar"
 AUTH_COOKIE_DIAS = 30
 
+# ─── Mitigación básica de fuerza bruta en el login ─────────────────────────
+# Contador de intentos fallidos guardado en st.session_state (no persiste
+# entre sesiones ni se comparte entre pestañas/navegadores): tras
+# LOGIN_MAX_INTENTOS fallos seguidos, exige esperar LOGIN_ESPERA_SEGUNDOS
+# antes de dejar reintentar. LÍMITE CONOCIDO Y ACEPTADO: como session_state
+# vive en la sesión del navegador, un atacante que abra una pestaña/sesión
+# nueva (o un script que reconecte) obtiene un contador en cero de nuevo --
+# esto NO es protección contra fuerza bruta distribuida ni scripted, es
+# solo fricción contra reintentos manuales repetidos en la misma sesión.
+# A propósito no hay CAPTCHA ni servicio externo ni estado persistente
+# (no se banea un usuario/IP de forma duradera).
+LOGIN_MAX_INTENTOS = 5
+LOGIN_ESPERA_SEGUNDOS = 30
+
 
 def _secreto_cookie_auth() -> str:
     try:
@@ -3779,23 +3839,43 @@ def _render_login():
     sesión con una cuenta válida y activa."""
     st.markdown("# 🎓 Herramientas Docentes")
     st.caption("Acceso restringido — ingresa con tu cuenta.")
+
+    _bloqueo_hasta = st.session_state.get("_login_bloqueo_hasta", 0.0)
+    _ahora = time.time()
+    if _ahora < _bloqueo_hasta:
+        st.error(f"Demasiados intentos fallidos. Espera "
+                  f"{int(_bloqueo_hasta - _ahora) + 1} segundos antes de volver a intentar.")
+        return
+
     with st.form("form_login"):
         usuario = st.text_input("Usuario")
         password = st.text_input("Clave", type="password")
-        recordar = st.checkbox(f"Recordarme en este dispositivo ({AUTH_COOKIE_DIAS} días)", value=True)
+        recordar = st.checkbox(f"Recordarme en este dispositivo ({AUTH_COOKIE_DIAS} días)", value=False)
         enviado = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
     if enviado:
         datos = registro_sheets.verificar_login(usuario, password)
         if datos:
+            st.session_state["_login_intentos_fallidos"] = 0
+            st.session_state["_login_bloqueo_hasta"] = 0.0
             st.session_state["auth_usuario"] = datos
             registro_sheets.registrar_evento(datos["usuario"], "login")
             if recordar:
                 token = _generar_token_recordar(datos["usuario"], _secreto_cookie_auth())
                 if token:
-                    _cookies.set(AUTH_COOKIE_NOMBRE, token, max_age=AUTH_COOKIE_DIAS * 86400)
+                    _cookies.set(AUTH_COOKIE_NOMBRE, token, path="/",
+                                  max_age=AUTH_COOKIE_DIAS * 86400,
+                                  secure=True, same_site="strict")
             st.rerun()
         else:
-            st.error("Usuario o clave incorrectos.")
+            intentos = st.session_state.get("_login_intentos_fallidos", 0) + 1
+            st.session_state["_login_intentos_fallidos"] = intentos
+            if intentos >= LOGIN_MAX_INTENTOS:
+                st.session_state["_login_bloqueo_hasta"] = time.time() + LOGIN_ESPERA_SEGUNDOS
+                st.session_state["_login_intentos_fallidos"] = 0
+                st.error(f"Demasiados intentos fallidos. Espera {LOGIN_ESPERA_SEGUNDOS} "
+                          f"segundos antes de volver a intentar.")
+            else:
+                st.error("Usuario o clave incorrectos.")
 
 
 if not st.session_state.get("auth_usuario"):

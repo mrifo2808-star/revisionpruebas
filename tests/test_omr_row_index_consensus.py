@@ -239,6 +239,21 @@ def test_caso17_tres_de_acuerdo_una_outlier(app):
     print("OK\n")
 
 
+def test_caso_consenso_2vs2_ninguna_mitad_gana_con_confianza(app):
+    print("=== CONSENSO 2 vs 2: dos bandas sugieren fase 0, dos sugieren +1 -- la mediana leave-one-out de CADA "
+          "banda queda dominada por la mitad OPUESTA (2 de los 3 restantes), asi que las 4 bandas terminan "
+          "reportando un shift != 0 con confianza alta -- el sistema NO puede, por si solo a nivel de sensor, "
+          "decidir cual mitad es la 'correcta'; eso lo debe resolver el combinador fallando cerrado, no este sensor ===")
+    y0s = [100.0, 100.1, 100.0 + N2_DY, 100.0 + N2_DY - 0.1]
+    ev = [True, True, True, True]
+    res = app.omr_calcular_consenso_fase_global(y0s, N2_DY, ev)
+    for i, r in enumerate(res):
+        print(f"banda {i}:", r)
+        assert r["row_shift_candidate"] != 0, \
+            f"banda {i}: en un 2 vs 2 real ninguna banda deberia quedar 'confirmada en 0' contra su propia mitad opuesta"
+    print("OK -- ninguna mitad se impone sola sobre la otra; el combinador debe fallar cerrado con esto\n")
+
+
 # ═══════════════════════ SENSOR 3 -- NUMBER LATTICE por hipotesis de shift ════════════
 
 def test_caso18_fila1_invisible(app):
@@ -468,6 +483,50 @@ def test_conflicto_real_entre_global_y_number(app):
     assert c["possible_row_index_shift"] is True
     assert c["recomendacion"] == "FAIL_CLOSED_REVISAR"
     print("OK\n")
+
+
+def test_consenso_2vs2_pipeline_falla_cerrado_nunca_auto_shift(app):
+    print("=== CONSENSO 2 vs 2 (combinador completo): dos bandas sugieren fase 0, dos sugieren +1 -- resultado "
+          "esperado AMBIGUO/REVISION/SIN VEREDICTO FUERTE para las 4, NUNCA un auto-shift ni un 'MANTENER' que "
+          "esconda el desacuerdo real entre bandas hermanas ===")
+    y0s = [100.0, 100.1, 100.0 + N2_DY, 100.0 + N2_DY - 0.1]
+    ev = [True, True, True, True]
+    global_por_banda = app.omr_calcular_consenso_fase_global(y0s, N2_DY, ev)
+    for i, g in enumerate(global_por_banda):
+        # ROW propio "clean" y NUMBER sin evidencia: aislamos el conflicto real
+        # al desacuerdo GLOBAL banda-vs-banda (2 vs 2), sin que ningun otro
+        # sensor pueda "resolver" el empate por su cuenta.
+        c = app.omr_consenso_indice_fila("clean", g, _number_diag(0, 0.0, suf=False))
+        print(f"banda {i}:", c)
+        assert c["recomendacion"] == "FAIL_CLOSED_REVISAR", \
+            f"banda {i}: un 2 vs 2 real nunca debe resolverse como MANTENER ni como shift confirmado"
+        assert c["row_shift_candidate"] == 0, \
+            f"banda {i}: FAIL CLOSED significa no comprometerse con NINGUN shift concreto, aunque el sensor " \
+            f"crudo reportara confianza alta para una direccion"
+        assert c["recomendacion"] != "SHIFT_PROBABLE_REVISAR", "un 2 vs 2 no es un shift 'probable', es ambiguo"
+    print("OK -- las 4 bandas quedan en revision, ninguna se auto-corrige ni se da por buena sola\n")
+
+
+def test_consenso_3vs1_pipeline_outlier_se_distingue_de_las_sanas(app):
+    print("=== CONSENSO 3 vs 1 (combinador completo): 3 bandas de acuerdo en fase 0 + 1 outlier claro -- "
+          "las 3 sanas deben poder mantenerse con confianza, y la outlier debe quedar marcada aparte "
+          "(nunca las 4 iguales, y la outlier nunca se corrige sola) ===")
+    y0s = [100.0, 100.3, 99.7, 100.0 + N2_DY]
+    ev = [True, True, True, True]
+    global_por_banda = app.omr_calcular_consenso_fase_global(y0s, N2_DY, ev)
+    veredictos = []
+    for i, g in enumerate(global_por_banda):
+        c = app.omr_consenso_indice_fila("clean", g, _number_diag(0, 0.0, suf=False))
+        print(f"banda {i}:", c)
+        veredictos.append(c)
+    for i in (0, 1, 2):
+        assert veredictos[i]["recomendacion"] == "MANTENER", \
+            f"banda sana {i} no deberia verse arrastrada a revision por la outlier"
+        assert veredictos[i]["row_shift_candidate"] == 0
+    assert veredictos[3]["recomendacion"] in ("FAIL_CLOSED_REVISAR", "SHIFT_PROBABLE_REVISAR"), \
+        "la banda outlier (3 vs 1) debe detectarse y distinguirse de las sanas, no pasar desapercibida"
+    assert veredictos[3]["recomendacion"] != "MANTENER", "el outlier detectado no puede quedar igual que las sanas"
+    print("OK -- el outlier se distingue de las 3 bandas sanas, sin auto-corregirse solo\n")
 
 
 # ═══════════════════ SHADOW MODE -- verificacion de que el flag por defecto no afecta nada ═══════════════

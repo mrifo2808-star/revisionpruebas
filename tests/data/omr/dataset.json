@@ -9,5 +9,16 @@
       "B","B","A","C","D","C","C","A","B","B","B","B","A","C","B","D","B","D","B","A",
       "D","C","C","D","C",null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
     ]
+  },
+  {
+    "imagen": "tests/data/omr/hoja_uso_exclusivo.jpg",
+    "n_preguntas": 80,
+    "solo_respuestas": false,
+    "respuestas_correctas": [
+      "C","D","A","D","C","B","B","D","C","A","B","A","B","B","A","D","D","D","D","B",
+      "A","C","A","C","B","C","D","D","A","A","C","C","B",null,"D","B","A","C","B","A",
+      "B","B","A","C","D","C","C","A","B","B","B","B","A","C","B","D","B","D","B","A",
+      "D","C","C","D","C",null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
+    ]
   }
 ]

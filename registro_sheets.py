@@ -173,7 +173,14 @@ def obtener_usuario_activo(usuario: str) -> dict | None:
 def registrar_evento(usuario: str, evento: str, **detalle) -> None:
     """Agrega una fila a la pestaña de registro (respaldo de actividad).
     FAIL-OPEN a propósito: nunca debe interrumpir el flujo real de la app
-    por un problema de respaldo (red, cuota de la API, permisos)."""
+    por un problema de respaldo (red, cuota de la API, permisos).
+
+    value_input_option="RAW": estos son metadatos de auditoría (quién,
+    cuándo, curso, contadores), no necesitamos que Sheets interprete nada
+    como fórmula -- "curso" en particular viene de un input de texto libre
+    del docente, así que con USER_ENTERED un valor que empezara con
+    =, +, - o @ se interpretaría como fórmula en la planilla. RAW lo
+    guarda siempre como texto literal."""
     try:
         fila = [
             datetime.datetime.now().isoformat(timespec="seconds"),
@@ -187,7 +194,7 @@ def registrar_evento(usuario: str, evento: str, **detalle) -> None:
             detalle.get("sin_identificar", ""),
             detalle.get("omr_engine_version", ""),
         ]
-        _hoja(HOJA_REGISTRO).append_row(fila, value_input_option="USER_ENTERED")
+        _hoja(HOJA_REGISTRO).append_row(fila, value_input_option="RAW")
     except Exception as e:
         print(f"[registro_sheets] no se pudo registrar evento '{evento}' de "
               f"'{usuario}': {e}", file=sys.stderr)
@@ -198,8 +205,12 @@ def agregar_usuario(usuario: str, password: str, nombre: str, rol: str = "docent
     """A diferencia de registrar_evento, esto SÍ propaga cualquier error --
     un fallo acá tiene que detener al administrador, no pasar en silencio."""
     password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    # RAW: mismo criterio que registrar_evento -- usuario/nombre son texto
+    # simple, no necesitan interpretación de fórmula, y el hash bcrypt debe
+    # guardarse literal (RAW no lo altera; ya era compatible con
+    # USER_ENTERED porque no empieza con =, +, - ni @).
     _hoja(HOJA_USUARIOS).append_row(
-        [usuario, password_hash, nombre, rol, "TRUE"], value_input_option="USER_ENTERED")
+        [usuario, password_hash, nombre, rol, "TRUE"], value_input_option="RAW")
 
 
 def listar_usuarios() -> list:
