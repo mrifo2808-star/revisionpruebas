@@ -9,3 +9,4 @@ opencv-python-headless>=4.9.0
 gspread>=6.0.0
 google-auth>=2.28.0
 bcrypt>=4.1.0
+streamlit-cookies-controller>=0.0.4
