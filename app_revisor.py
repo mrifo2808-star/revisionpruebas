@@ -21,6 +21,7 @@ from PIL import Image, ImageEnhance, ImageOps
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 # Motor OMR (opcional): si opencv/numpy no están disponibles en el entorno de
 # despliegue, la app sigue funcionando 100% igual que antes con el flujo solo-IA
@@ -2453,6 +2454,74 @@ def pauta_desde_df(df: pd.DataFrame) -> list:
         for r in df["Respuesta"].fillna("").tolist()
     ]
 
+
+# ─── Pauta desde Excel (alternativa de ingreso, además del grid y el pegado
+# rápido) ───────────────────────────────────────────────────────────────
+def generar_plantilla_pauta_excel(n: int) -> bytes:
+    """Plantilla mínima para completar la pauta fuera de la app: dos
+    columnas (N°, Respuesta), con una lista desplegable A-E en la columna
+    Respuesta para evitar errores de tipeo. Misma estructura de 2 columnas
+    que lee de vuelta `pauta_desde_excel_bytes`."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Pauta"
+    az = PatternFill("solid", fgColor="2563EB")
+    for col, titulo in ((1, "N°"), (2, "Respuesta")):
+        c = ws.cell(1, col, titulo)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = az
+        c.alignment = Alignment(horizontal="center")
+    for i in range(1, n + 1):
+        ws.cell(i + 1, 1, f"P{i}").alignment = Alignment(horizontal="center")
+    dv = DataValidation(type="list", formula1='"A,B,C,D,E"', allow_blank=True,
+                         showErrorMessage=True, errorTitle="Valor inválido",
+                         error="Ingresa solo A, B, C, D o E.")
+    ws.add_data_validation(dv)
+    dv.add(f"B2:B{n + 1}")
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 12
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def pauta_desde_excel_bytes(datos: bytes, n: int) -> tuple:
+    """Lee un Excel subido por la persona usuaria (idealmente la plantilla de
+    `generar_plantilla_pauta_excel`, pero tolera cualquier archivo con una
+    columna de respuesta reconocible) y devuelve (pauta, avisos) -- pauta
+    siempre de largo n, igual que pauta_desde_df, para poder cargarla directo
+    en pauta_df sin tocar el resto del flujo. avisos son mensajes para
+    mostrar en la UI (nunca excepciones: un Excel mal formado se trata como
+    "no se encontraron respuestas", no como un crash)."""
+    avisos = []
+    try:
+        df = pd.read_excel(io.BytesIO(datos))
+    except Exception as e:
+        return [None] * n, [f"No se pudo leer el archivo: {e}"]
+    if df.empty or len(df.columns) == 0:
+        return [None] * n, ["El archivo está vacío."]
+
+    candidatos = {"respuesta", "alternativa", "correcta", "pauta", "clave"}
+    col_resp = next((c for c in df.columns if str(c).strip().lower() in candidatos), df.columns[-1])
+    valores = df[col_resp].tolist()
+
+    if len(valores) != n:
+        avisos.append(f"El archivo trae {len(valores)} fila(s) para una pauta de {n} preguntas "
+                       "-- se completa/recorta según corresponda.")
+
+    pauta, n_invalidas = [], 0
+    for i in range(n):
+        v = valores[i] if i < len(valores) else None
+        letra = str(v).strip().upper() if pd.notna(v) else ""
+        if letra and letra not in LETRAS_VALIDAS:
+            n_invalidas += 1
+        pauta.append(letra if letra in LETRAS_VALIDAS else None)
+    if n_invalidas:
+        avisos.append(f"{n_invalidas} valor(es) no reconocido(s) como A-E se dejaron en blanco.")
+    return pauta, avisos
+
+
 def guardar_info_edit(arch, campo, valor):
     if arch not in st.session_state.info_edits:
         st.session_state.info_edits[arch] = {}
@@ -2633,6 +2702,9 @@ def render_revisor_pruebas():
             st.session_state["n_preguntas"] = n_nuevo
             st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
             st.session_state["pauta"] = []
+            st.session_state.pop("pauta_excel_hash", None)
+            st.session_state.pop("pauta_excel_avisos", None)
+            st.session_state.pop("pauta_excel_n_cargadas", None)
             st.rerun()
         st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
         st.markdown("---")
@@ -2699,6 +2771,9 @@ def render_revisor_pruebas():
                 "resultados":{}, "correcciones":{}, "info_edits":{},
                 "fotos_pendientes":{}, "pauta":[], "pauta_df":df_pauta_vacio(nn),
             })
+            st.session_state.pop("pauta_excel_hash", None)
+            st.session_state.pop("pauta_excel_avisos", None)
+            st.session_state.pop("pauta_excel_n_cargadas", None)
             st.rerun()
         st.caption(f"Versión {VERSION_APP} · OMR {OMR_ENGINE_VERSION} · Actualizado {FECHA_ACTUALIZACION}")
         st.caption(f"Desarrollado por {DESARROLLADO_POR}")
@@ -2738,6 +2813,42 @@ def render_revisor_pruebas():
                     st.rerun()
                 else:
                     st.error("No se encontraron letras A–E válidas.")
+
+            st.markdown("---")
+            st.markdown("**Desde Excel**")
+            st.download_button(
+                "📥 Descargar plantilla de pauta", data=generar_plantilla_pauta_excel(n),
+                file_name=f"plantilla_pauta_{n}preguntas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="descargar_plantilla_pauta",
+            )
+            archivo_pauta = st.file_uploader(
+                "Subir Excel con la pauta", type=["xlsx"], key="upload_pauta_excel",
+                label_visibility="collapsed",
+            )
+            if archivo_pauta is not None:
+                datos_excel = archivo_pauta.getvalue()
+                hash_excel = hashlib.md5(datos_excel).hexdigest()
+                if st.session_state.get("pauta_excel_hash") != hash_excel:
+                    pauta_leida, avisos = pauta_desde_excel_bytes(datos_excel, n)
+                    st.session_state["pauta_excel_hash"] = hash_excel
+                    st.session_state["pauta_excel_avisos"] = avisos
+                    st.session_state["pauta_excel_n_cargadas"] = sum(1 for p in pauta_leida if p)
+                    if any(pauta_leida):
+                        st.session_state["pauta_df"] = pd.DataFrame({
+                            "N°": [f"P{i}" for i in range(1, n + 1)],
+                            "Respuesta": pd.array(pauta_leida, dtype="object"),
+                        })
+                    st.rerun()
+                else:
+                    n_cargadas = st.session_state.get("pauta_excel_n_cargadas", 0)
+                    if n_cargadas:
+                        st.success(f"✓ {n_cargadas} respuestas cargadas desde \"{archivo_pauta.name}\"")
+                    else:
+                        st.error("No se encontraron respuestas válidas (A-E) en el archivo.")
+                    for aviso in st.session_state.get("pauta_excel_avisos", []):
+                        st.warning(aviso)
+
             st.markdown("---")
             pauta_actual = pauta_desde_df(st.session_state["pauta_df"])
             completadas  = sum(1 for p in pauta_actual if p)
