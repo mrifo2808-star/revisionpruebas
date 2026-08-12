@@ -98,9 +98,11 @@ def test_registrar_evento_falla_abierto_si_sheets_falla(monkeypatch):
 class _HojaFalsaQueRegistra:
     def __init__(self):
         self.filas = []
+        self.value_input_options = []
 
     def append_row(self, fila, value_input_option=None):
         self.filas.append(fila)
+        self.value_input_options.append(value_input_option)
 
 
 def test_registrar_evento_arma_la_fila_en_el_orden_correcto(monkeypatch):
@@ -129,6 +131,18 @@ def test_registrar_evento_login_sin_detalle_no_lanza(monkeypatch):
     monkeypatch.setattr(rs, "_hoja", lambda nombre: hoja_falsa)
     rs.registrar_evento("ana", "login")
     assert len(hoja_falsa.filas) == 1
+    print("OK\n")
+
+
+def test_registrar_evento_usa_raw_no_interpreta_formulas(monkeypatch):
+    print("=== registrar_evento: envia value_input_option=RAW, para que Sheets NUNCA interprete formulas ===")
+    hoja_falsa = _HojaFalsaQueRegistra()
+    monkeypatch.setattr(rs, "_hoja", lambda nombre: hoja_falsa)
+    # 'curso' viene de un input de texto libre del docente -- si empezara
+    # con =, +, - o @ y se enviara como USER_ENTERED, Sheets lo trataria
+    # como formula. Con RAW se guarda siempre como texto literal.
+    rs.registrar_evento("ana", "export_excel", curso="=HYPERLINK(\"http://evil\")")
+    assert hoja_falsa.value_input_options == ["RAW"]
     print("OK\n")
 
 
