@@ -118,6 +118,23 @@ OMR_N_FILAS_POR_BLOQUE = 20  # fijo por diseño de la plantilla impresa (igual q
 # aporta más de lo que arriesga -- requiere muestrear la franja de números a
 # mayor resolución antes de poder usarse como gate real.
 NUMBER_LATTICE_CROSSCHECK_HABILITADO = False
+
+# Feature flag: el TRIPLE CHECK DE ÍNDICE DE FILA (v4.2 -- ver
+# "TRIPLE CHECK DE ÍNDICE DE FILA" más abajo: omr_calcular_consenso_fase_global,
+# omr_number_lattice_shift_hypothesis, omr_consenso_indice_fila) se calcula y
+# se expone SIEMPRE en diagnóstico (row_index_consensus_por_banda), pero su
+# veto sobre geometry_confidence arranca OFF por defecto -- SHADOW MODE.
+# Motivo: es un mecanismo nuevo, sin todavía evidencia de cero falsos
+# positivos contra fotos reales variadas (la única evidencia real disponible
+# hoy es el smoke set chico de este repo) -- mismo criterio que
+# NUMBER_LATTICE_CROSSCHECK_HABILITADO arriba: no se habilita un gate
+# adicional que puede mandar una banda sana a GEOMETRY_ERROR sin antes medirlo
+# contra fotos reales variadas. Con el flag OFF, el consenso SOLO diagnostica
+# (métricas + posible_row_index_shift expuestos para análisis), nunca cambia
+# una respuesta ni una geometry_confidence. Cuando se habilita, el efecto es
+# SIEMPRE degradar/vetar (mandar la banda a revisión manual), nunca
+# auto-corregir el índice de fila -- ver omr_consenso_indice_fila.
+ROW_INDEX_CONSENSUS_VETO_HABILITADO = False
 OMR_LETRAS = ["A", "B", "C", "D", "E"]
 
 # Perfil de la plantilla física impresa. Existe para que el N máximo de
@@ -1023,6 +1040,316 @@ def omr_crosscheck_bubble_number(bubble_y_centers, number_lat, dy):
 # ─────────────────────── fin NUMBER LATTICE (v4.1) ────────────────────────
 
 
+# ──────────────── TRIPLE CHECK DE ÍNDICE DE FILA (v4.2, SHADOW MODE) ──────────────────
+# Objetivo: reducir aún más el error más peligroso del OMR -- una respuesta
+# VISUALMENTE bien leída pero asignada al número de pregunta equivocado
+# (ROW_INDEX_SHIFT). El ROW LATTICE (arriba) ya es el sensor principal y ya
+# se auto-corrige con evidencia LOCAL fuerte (ver ROW_INDEX_SHIFT_corregido en
+# omr_ajustar_lattice_vertical). Esto agrega dos sensores geométricos
+# INDEPENDIENTES más, y un combinador de consenso fail-closed:
+#
+#   SENSOR 2 -- GLOBAL ROW PHASE CONSENSUS (omr_calcular_consenso_fase_global):
+#     las 4 bandas pertenecen a la misma hoja impresa, así que su y0 (posición
+#     física de la fila índice 0) debería coincidir aproximadamente entre sí
+#     -- a diferencia de dy_global (periodo, ya compartido en producción),
+#     esto es consenso de FASE/ORIGEN entre bandas hermanas.
+#
+#   SENSOR 3 -- NUMBER LATTICE por HIPÓTESIS DE SHIFT
+#     (omr_number_lattice_shift_hypothesis): en vez de estimar un origen/
+#     período propio desde cero para la franja de números (como hace
+#     omr_ajustar_number_lattice, sensible a que falte justo el primer
+#     número -- ver el falso positivo real documentado junto a
+#     NUMBER_LATTICE_CROSSCHECK_HABILITADO), evalúa hipótesis de alineamiento
+#     directamente contra el lattice de burbujas YA resuelto (robusto a filas
+#     faltantes por construcción): para cada shift candidato, cuenta cuántas
+#     observaciones de tinta caen cerca de bubble_y_centers + shift*dy, y
+#     exige una ventaja de voto CLARA sobre la segunda mejor hipótesis antes
+#     de afirmar nada -- un único número ausente nunca puede ganar esa
+#     ventaja por sí solo.
+#
+#   CONSENSO (omr_consenso_indice_fila): combina las tres señales sin dejar
+#     que ninguna por sí sola pueda remapear preguntas. El NUMBER LATTICE es
+#     deliberadamente un sensor AUXILIAR, nunca la fuente primaria (ver
+#     NUMBER_LATTICE_CROSSCHECK_HABILITADO: ya hubo un falso positivo real de
+#     este sensor). SHADOW MODE (ROW_INDEX_CONSENSUS_VETO_HABILITADO=False
+#     por defecto): el resultado se expone siempre en diagnóstico, pero
+#     nunca remapea filas ni cambia una respuesta confiable por sí solo.
+def _omr_mad(values):
+    """Median Absolute Deviation -- escala robusta (un solo outlier no puede
+    dominarla, a diferencia de la desviación estándar)."""
+    values = np.asarray(values, dtype=np.float64)
+    if len(values) == 0:
+        return 0.0
+    med = np.median(values)
+    return float(np.median(np.abs(values - med)))
+
+
+def omr_calcular_consenso_fase_global(bandas_y0, dy_global, evidencia_suficiente,
+                                       umbral_residual_ok=0.20, umbral_pool_ok=0.30):
+    """SENSOR 2 -- GLOBAL ROW PHASE CONSENSUS (shadow mode).
+
+    Para cada banda, el "consenso" contra el que se compara es la MEDIANA del
+    y0 de las DEMÁS bandas con evidencia suficiente (leave-one-out): con 4
+    bandas esto tolera hasta una banda con un y0 realmente corrido sin que
+    ese outlier pueda arrastrar su propio veredicto -- un valor lejano nunca
+    gana una mediana de (al menos) 2-3 valores (estimador robusto tipo
+    RANSAC/mediana, no un promedio simple que un solo outlier sí movería).
+
+    bandas_y0: y0 (píxeles, ya en la misma escala/referencia) por banda, en
+      el mismo orden que las bandas reales.
+    evidencia_suficiente: lista paralela de bool -- solo bandas con evidencia
+      propia razonable entran al pool de referencia Y pueden recibir un
+      veredicto (una banda sin evidencia no puede ser jueza ni acusada, ítem
+      "banda sin suficiente evidencia" del plan).
+
+    Devuelve una lista de dicts por banda:
+      row_shift_candidate: entero, cuántos "dy" separan el y0 de esta banda
+        del consenso de sus hermanas (0 = alineada).
+      row_shift_confidence: 0..1, qué tan limpiamente explica esa hipótesis
+        la discrepancia observada (combina qué tan chico es el residuo tras
+        aplicar el shift entero, y qué tan de acuerdo estaba el propio pool
+        de referencia entre sí).
+      global_phase_error: el residuo normalizado por dy tras aplicar la
+        mejor hipótesis de shift entero (0 = explicación perfecta).
+      evidencia_suficiente: si esta banda tuvo pool de referencia (>=2
+        bandas hermanas con evidencia) para poder emitir un veredicto.
+    """
+    n = len(bandas_y0)
+    resultados = []
+    if not dy_global or dy_global <= 0:
+        return [{"row_shift_candidate": 0, "row_shift_confidence": 0.0,
+                  "global_phase_error": None, "evidencia_suficiente": False} for _ in range(n)]
+    for i in range(n):
+        if not evidencia_suficiente[i]:
+            resultados.append({"row_shift_candidate": 0, "row_shift_confidence": 0.0,
+                                "global_phase_error": None, "evidencia_suficiente": False})
+            continue
+        referencia = [bandas_y0[j] for j in range(n) if j != i and evidencia_suficiente[j]]
+        if len(referencia) < 2:
+            resultados.append({"row_shift_candidate": 0, "row_shift_confidence": 0.0,
+                                "global_phase_error": None, "evidencia_suficiente": False})
+            continue
+        consenso = float(np.median(referencia))
+        spread_norm = _omr_mad(referencia) / dy_global
+        offset = bandas_y0[i] - consenso
+        shift_candidate = int(round(offset / dy_global))
+        residual_norm = abs(offset - shift_candidate * dy_global) / dy_global
+        conf_residuo = max(0.0, 1.0 - residual_norm / umbral_residual_ok)
+        conf_pool = max(0.0, 1.0 - spread_norm / umbral_pool_ok)
+        confianza = float(np.clip(conf_residuo * conf_pool, 0.0, 1.0))
+        resultados.append({"row_shift_candidate": shift_candidate, "row_shift_confidence": round(confianza, 4),
+                            "global_phase_error": round(residual_norm, 4), "evidencia_suficiente": True})
+    return resultados
+
+
+def omr_number_lattice_shift_hypothesis(obs_y, bubble_y_centers, dy, shifts=(-2, -1, 0, 1, 2),
+                                         min_obs=4, tol_frac=0.4, margen_minimo=2):
+    """SENSOR 3 (v2, robusto) -- NUMBER LATTICE por hipótesis de shift.
+
+    A diferencia de omr_ajustar_number_lattice (que estima un y0/dy propio
+    desde cero para la franja de números, y por eso es sensible a que falte
+    justo la evidencia que ancla el origen -- la causa exacta del falso
+    positivo histórico del dígito "1"), esta versión NUNCA inventa un origen
+    propio: evalúa directamente qué tan bien cada hipótesis de shift entero
+    (bubble_y_centers + shift*dy) explica las observaciones de tinta reales
+    de la franja de números, vía matching monotónico greedy (cada
+    observación se asigna, si puede, a la fila hipotética más cercana sin
+    reusar la misma fila dos veces).
+
+    obs_y: posiciones Y (píxeles) de tinta detectada en la franja de números
+      de esta banda (ver _omr_detectar_number_y_obs).
+    bubble_y_centers: los y_centers YA resueltos del lattice de burbujas de
+      esta banda (el ancla -- ya es robusto a filas faltantes).
+    dy: período de la banda (mismo dy del lattice de burbujas).
+
+    IMPORTANTE (calibrado empíricamente, no a ojo -- ver tests): en una
+    grilla PERFECTAMENTE periódica de n_filas, un shift de una fila entera
+    es estructuralmente casi indistinguible de sus vecinos por matching
+    interior -- correr TODA la hipótesis un dy no cambia dónde caen ~19 de
+    20 puntos interiores (bubble_y_centers está casi uniformemente
+    espaciado, así que la hipótesis vecina "absorbe" el shift reasignando
+    cada punto a la fila de al lado). La única señal real que sí distingue
+    la hipótesis correcta es el BORDE: exactamente UN voto de ventaja sobre
+    la segunda mejor hipótesis (la fila que se cae por un extremo del
+    lattice de burbujas y no encuentra pareja). Por eso el margen exigido es
+    >= 1 (no un porcentaje de n_filas -- eso jamás se alcanzaría ni con
+    evidencia perfecta), y la confianza se apoya en cuánta EXTENSIÓN de la
+    grilla (fracción de observaciones explicadas, escalada por cuántas
+    filas hay realmente en juego -- pocas observaciones nunca deben
+    alcanzar confianza alta aunque el margen "cierre" por casualidad) queda
+    explicada por la hipótesis ganadora, no en el margen crudo (que
+    estructuralmente casi nunca pasa de 1). Un único número ausente o
+    espurio no puede mover ningún voto en más de 1 -- si eso alcanza para
+    "ganar" un margen de 1 sobre un empate previo, la fracción explicada
+    también cae, y la confianza se escala hacia abajo en la misma medida
+    (ver n_obs/(0.5*n_filas) más abajo): nunca alcanza sola para "fuerte".
+    """
+    obs_y = np.asarray(obs_y, dtype=np.float64).reshape(-1)
+    n_obs = len(obs_y)
+    bubble_y_centers = np.asarray(bubble_y_centers, dtype=np.float64)
+    n_filas = len(bubble_y_centers)
+    if n_obs < min_obs or not dy or dy <= 0 or n_filas == 0:
+        return {"shift_candidate": 0, "shift_confidence": 0.0, "number_phase_error": None,
+                "evidencia_suficiente": False, "n_obs": int(n_obs)}
+    tol = max(margen_minimo, tol_frac * dy)
+    votos = {}
+    for s in shifts:
+        hip = bubble_y_centers + s * dy
+        usados = np.zeros(len(hip), dtype=bool)
+        hits = 0
+        for y in np.sort(obs_y):
+            d = np.abs(hip - y)
+            d = np.where(usados, np.inf, d)
+            j = int(np.argmin(d))
+            if d[j] <= tol:
+                hits += 1
+                usados[j] = True
+        votos[s] = hits
+    mejor_shift = max(votos, key=lambda s: votos[s])
+    hits_mejor = votos[mejor_shift]
+    resto = sorted((v for s, v in votos.items() if s != mejor_shift), reverse=True)
+    segundo = resto[0] if resto else 0
+    margen = hits_mejor - segundo
+    frac_explicada = hits_mejor / n_obs
+    evidencia_clara = margen >= 1 and frac_explicada >= 0.5
+    # Escala por densidad de evidencia: con pocas observaciones (cerca de
+    # min_obs) un margen de 1 puede "cerrar" por casualidad -- la confianza
+    # solo alcanza su valor pleno (frac_explicada) cuando hay evidencia de
+    # al menos la mitad de las filas físicas; por debajo escala linealmente.
+    densidad = min(1.0, n_obs / max(1.0, 0.5 * n_filas))
+    confianza = float(np.clip(frac_explicada * densidad, 0.0, 1.0)) if evidencia_clara else 0.0
+    return {
+        "shift_candidate": int(mejor_shift) if evidencia_clara else 0,
+        "shift_confidence": round(confianza, 4),
+        "number_phase_error": round(1.0 - frac_explicada, 4),
+        "evidencia_suficiente": True,
+        "n_obs": int(n_obs), "hits_mejor": int(hits_mejor), "margen": int(margen),
+    }
+
+
+def omr_consenso_indice_fila(row_risk_level, global_diag, number_diag,
+                              umbral_fuerte=0.6, umbral_debil=0.3):
+    """Combina las tres señales de índice de fila en un único diagnóstico de
+    consenso -- SOLO PARA DIAGNÓSTICO mientras ROW_INDEX_CONSENSUS_VETO_HABILITADO
+    esté en False (shadow mode): esta función NUNCA remapea filas ni decide
+    una respuesta por sí sola, solo produce las métricas que el llamador
+    (omr_ajustar_grilla) puede usar o no, según el feature flag.
+
+    row_risk_level: "clean" | "ambiguous" | "corrected" -- el propio ROW
+      LATTICE (sensor 1) ya reporta esto vía
+      omr_ajustar_lattice_vertical(...)["diagnostico"]["violaciones"]
+      (ROW_INDEX_SHIFT_ambiguo / ROW_INDEX_SHIFT_corregido). No es un voto de
+      dirección (ROW ya se auto-corrigió con evidencia LOCAL antes de llegar
+      acá) sino un nivel de riesgo propio que corrobora o no lo que GLOBAL/
+      NUMBER encuentran comparando contra el lattice YA (posiblemente)
+      corregido.
+    global_diag: dict de omr_calcular_consenso_fase_global para esta banda.
+    number_diag: dict de omr_number_lattice_shift_hypothesis para esta banda.
+
+    Implementa los 4 casos del plan (sección "lógica de consenso"), EN ESTE
+    ORDEN DE PRIORIDAD (el orden es la parte crítica -- ver caso A/D más
+    abajo, evaluado ANTES que cualquier voto de NUMBER):
+      A/D. ROW sin riesgo propio + GLOBAL fuerte de acuerdo en "sin shift"
+           -> se mantiene la geometría SIN IMPORTAR lo que diga NUMBER --
+           ni una señal débil ni una señal fuerte pero equivocada de NUMBER
+           puede vetar esto. NUMBER es sensor AUXILIAR, nunca fuente
+           primaria (item crítico del plan: un NUMBER equivocado con
+           evidencia propia aparentemente fuerte jamás puede, por sí solo,
+           generar un shift contra dos sensores independientes que
+           coinciden -- el caso exacto del falso positivo histórico del
+           dígito "1", generalizado a cualquier evidencia de NUMBER, débil
+           o fuerte).
+      B.   GLOBAL y NUMBER, los dos con evidencia fuerte, de acuerdo en el
+           mismo shift != 0 -> shift altamente probable. Aun así, el
+           resultado es "mandar a revisión", nunca un auto-shift.
+      C.   Ninguna combinación de dos sensores fuertes se pone de acuerdo,
+           pero SÍ hay alguna señal de riesgo real (propia de ROW, o un
+           shift != 0 -- débil o fuerte, contradictorio entre sí o no --
+           de GLOBAL/NUMBER) -> FAIL CLOSED: no se inventa nada, se
+           recomienda revisión.
+      (default) Sin ninguna señal de riesgo en ningún sensor -> se mantiene
+           la geometría, sin marcar nada para revisión.
+    """
+    def _fuerza(conf, suficiente):
+        if not suficiente:
+            return "ninguna"
+        if conf >= umbral_fuerte:
+            return "fuerte"
+        if conf >= umbral_debil:
+            return "debil"
+        return "ninguna"
+
+    g_suf = bool(global_diag.get("evidencia_suficiente", False))
+    g_shift = global_diag.get("row_shift_candidate", 0) if g_suf else 0
+    g_conf = global_diag.get("row_shift_confidence", 0.0) if g_suf else 0.0
+    g_fuerza = _fuerza(g_conf, g_suf)
+
+    n_suf = bool(number_diag.get("evidencia_suficiente", False))
+    n_shift = number_diag.get("shift_candidate", 0) if n_suf else 0
+    n_conf = number_diag.get("shift_confidence", 0.0) if n_suf else 0.0
+    n_fuerza = _fuerza(n_conf, n_suf)
+
+    row_riesgo = row_risk_level != "clean"
+    band_outlier = bool(g_fuerza == "fuerte" and g_shift != 0)
+
+    resultado = {
+        "row_shift_candidate": 0, "row_shift_confidence": 0.0,
+        "global_phase_error": global_diag.get("global_phase_error"),
+        "number_phase_error": number_diag.get("number_phase_error"),
+        "sensor_agreement": False, "sensor_conflict": False,
+        "band_outlier": band_outlier, "possible_row_index_shift": False,
+        "recomendacion": "MANTENER",
+    }
+
+    # Caso A/D (incluye el caso crítico "NUMBER equivocado con ROW+GLOBAL
+    # correctos"): se evalúa PRIMERO, antes de mirar a NUMBER para nada --
+    # dos señales independientes (ROW propio + GLOBAL cruzado entre bandas)
+    # de acuerdo en "sin shift" es autoridad suficiente, y NUMBER nunca
+    # puede ganarle a eso, sea cual sea su confianza.
+    if not row_riesgo and g_fuerza == "fuerte" and g_shift == 0:
+        resultado.update(row_shift_candidate=0, row_shift_confidence=round(g_conf, 4),
+                          sensor_agreement=True, possible_row_index_shift=False,
+                          recomendacion="MANTENER")
+        return resultado
+
+    # Caso B: GLOBAL y NUMBER, ambos fuertes, de acuerdo en el mismo shift != 0.
+    if g_fuerza == "fuerte" and n_fuerza == "fuerte" and g_shift == n_shift and g_shift != 0:
+        resultado.update(row_shift_candidate=g_shift, row_shift_confidence=round(min(g_conf, n_conf), 4),
+                          sensor_agreement=True, possible_row_index_shift=True,
+                          recomendacion="SHIFT_PROBABLE_REVISAR")
+        return resultado
+
+    # Conflicto real: dos sensores fuertes en desacuerdo entre sí sobre CUÁL
+    # es el shift (ninguno tiene autoridad sobre el otro para desempatar).
+    if g_fuerza == "fuerte" and n_fuerza == "fuerte" and g_shift != n_shift:
+        resultado.update(sensor_conflict=True, possible_row_index_shift=True,
+                          recomendacion="FAIL_CLOSED_REVISAR")
+        return resultado
+
+    # Riesgo propio de ROW corroborado por al menos una señal fuerte
+    # adicional de acuerdo en un shift != 0.
+    if row_riesgo and ((g_fuerza == "fuerte" and g_shift != 0) or (n_fuerza == "fuerte" and n_shift != 0)):
+        shift = g_shift if (g_fuerza == "fuerte" and g_shift != 0) else n_shift
+        resultado.update(row_shift_candidate=shift, row_shift_confidence=0.5,
+                          possible_row_index_shift=True, recomendacion="SHIFT_PROBABLE_REVISAR")
+        return resultado
+
+    # Caso C (y default): ninguna combinación da un veredicto fuerte y
+    # limpio. Solo cuenta como señal de riesgo real un shift != 0 (débil o
+    # fuerte) de GLOBAL/NUMBER, o el riesgo propio de ROW -- una confianza
+    # baja/media en "sin shift" (shift==0) NUNCA es una señal de riesgo, es
+    # simplemente una confirmación débil de que todo está bien y no debe
+    # empujar a revisión. Si no hay ninguna señal real, se mantiene tal cual
+    # (resultado por defecto ya es "MANTENER").
+    riesgo_global = g_suf and g_shift != 0 and g_fuerza != "ninguna"
+    riesgo_number = n_suf and n_shift != 0 and n_fuerza != "ninguna"
+    hay_alguna_senal = row_riesgo or riesgo_global or riesgo_number
+    if hay_alguna_senal:
+        resultado.update(possible_row_index_shift=True, recomendacion="FAIL_CLOSED_REVISAR")
+    return resultado
+# ────────────── fin TRIPLE CHECK DE ÍNDICE DE FILA (v4.2, SHADOW MODE) ─────────────────
+
+
 def _omr_validar_invariantes_banda(y_centers, x_centers, radio, bh, bw, n_filas):
     """
     Invariantes geométricos duros sobre la grilla YA ajustada de una banda --
@@ -1218,8 +1545,13 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE, bandas_
 
     # --- Pasada 2: fila (y) final vía row lattice robusto, con dy_global como prior ---
     y_centers_por_banda, band_x_centers, radios = [], [], []
-    geometry_confidence, geometry_violaciones, geometry_source = [], [], []
+    geometry_source = []
     row_alignment_confidence_por_banda, row_source_por_banda = [], []
+    # Acumuladores intermedios por banda -- geometry_confidence se termina de
+    # calcular recién en la Pasada 3, después de poder correr el SENSOR 2
+    # (GLOBAL ROW PHASE CONSENSUS), que necesita el y0 de TODAS las bandas ya
+    # resuelto antes de poder comparar unas contra otras.
+    _pendiente = []
     for info in banda_info:
         sel, x_c, r_banda = info["sel"], info["x_c"], info["r_banda"]
         obs_xy = sel[:, :2] if len(sel) else np.empty((0, 2))
@@ -1271,15 +1603,61 @@ def omr_ajustar_grilla(body_gray, bands, n_filas=OMR_N_FILAS_POR_BLOQUE, bandas_
         # fail-closed (item 17): ninguna banda puede llegar a GEOMETRY_OK si
         # su alineación vertical no está demostrada, aunque las otras tres
         # señales (ancho, invariantes, fuente de columnas) estén perfectas.
-        geo_conf = (0.0 if info["banda_vacia"] else
-                    info["ancho_conf"] * mult_inv * mult_fuente * lattice["row_alignment_confidence"] * mult_crosscheck)
+        geo_conf_base = (0.0 if info["banda_vacia"] else
+                          info["ancho_conf"] * mult_inv * mult_fuente * lattice["row_alignment_confidence"] * mult_crosscheck)
+        _pendiente.append({"info": info, "x_c": x_c, "r_banda": r_banda, "lattice": lattice,
+                            "violaciones": violaciones, "geo_conf_base": geo_conf_base})
+
+    # --- Pasada 3: TRIPLE CHECK DE ÍNDICE DE FILA (v4.2, SHADOW MODE) ---
+    # SENSOR 2 (GLOBAL ROW PHASE CONSENSUS): recién acá, con el y0 de las 4
+    # bandas ya resuelto, se puede comparar la fase/origen de cada banda
+    # contra sus hermanas (ver omr_calcular_consenso_fase_global).
+    bandas_y0 = [p["lattice"]["y0"] for p in _pendiente]
+    evidencia_global = [p["lattice"]["row_source"] != "UNIFORM_FALLBACK" and
+                         p["lattice"]["row_alignment_confidence"] > 0.3 for p in _pendiente]
+    consenso_global_por_banda = omr_calcular_consenso_fase_global(bandas_y0, dy_global, evidencia_global)
+
+    geometry_confidence, geometry_violaciones = [], []
+    row_index_consensus_por_banda = []
+    for p, global_diag in zip(_pendiente, consenso_global_por_banda):
+        info, x_c, r_banda, lattice = p["info"], p["x_c"], p["r_banda"], p["lattice"]
+        violaciones = p["violaciones"]
+
+        # SENSOR 3 (NUMBER LATTICE por hipótesis de shift, v2 robusto): se
+        # apoya en la MISMA franja de números que el sensor v4.1 de arriba,
+        # pero comparando hipótesis de shift contra el lattice de burbujas ya
+        # resuelto en vez de estimar un origen propio desde cero -- ver
+        # omr_number_lattice_shift_hypothesis.
+        franja = _omr_franja_numeros(body_gray, info["x0"], x_c[0], r_banda)
+        obs_numeros = _omr_detectar_number_y_obs(franja) if franja is not None else np.empty((0,))
+        number_diag = omr_number_lattice_shift_hypothesis(obs_numeros, lattice["y_centers"], lattice["dy"])
+
+        row_risk_level = ("corrected" if "ROW_INDEX_SHIFT_corregido" in lattice["diagnostico"].get("violaciones", [])
+                           else "ambiguous" if "ROW_INDEX_SHIFT_ambiguo" in lattice["diagnostico"].get("violaciones", [])
+                           else "clean")
+        consenso = omr_consenso_indice_fila(row_risk_level, global_diag, number_diag)
+        row_index_consensus_por_banda.append(consenso)
+
+        mult_consenso = 1.0
+        if consenso["recomendacion"] != "MANTENER":
+            etiqueta = f"ROW_INDEX_CONSENSUS_{consenso['recomendacion']}"
+            violaciones.append(etiqueta if ROW_INDEX_CONSENSUS_VETO_HABILITADO
+                                else f"{etiqueta}_ignorado_flag_off")
+            if ROW_INDEX_CONSENSUS_VETO_HABILITADO:
+                # Preferir veto/degradación de confianza a auto-shift (nunca
+                # se remapean filas acá): manda la banda a revisión, nunca
+                # inventa ni corrige el índice por sí sola.
+                mult_consenso = 0.0
+
+        geo_conf = p["geo_conf_base"] * mult_consenso
         geometry_confidence.append(geo_conf)
         geometry_violaciones.append(violaciones)
 
     radio = float(np.median(radios))
     return (np.array(y_centers_por_banda), np.array(band_x_centers), radio,
             geometry_confidence, geometry_violaciones, geometry_source,
-            row_alignment_confidence_por_banda, row_source_por_banda)
+            row_alignment_confidence_por_banda, row_source_por_banda,
+            row_index_consensus_por_banda)
 
 
 def _omr_oscuridad_celda(gray, cx, cy, r, r_inner_frac=0.6):
@@ -1512,7 +1890,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
         permitir_reparto_geometrico=not es_recorte)
     body_gray_det = gray_det[header_bottom_det:, :]
     (y_centers_det, band_x_centers_det, radio_det, geometry_confidence, geometry_violaciones, geometry_source,
-     row_alignment_confidence_por_banda, row_source_por_banda) = (
+     row_alignment_confidence_por_banda, row_source_por_banda, row_index_consensus_por_banda) = (
         omr_ajustar_grilla(body_gray_det, bands_det, bandas_fabricadas=bandas_fabricadas))
 
     # Escalar toda la geometría encontrada de vuelta a la resolución original
@@ -1554,6 +1932,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
             r["geometry_source"] = geometry_source[bi]
             r["row_alignment_confidence"] = row_alignment_confidence_por_banda[bi]
             r["row_source"] = row_source_por_banda[bi]
+            r["row_index_consensus"] = row_index_consensus_por_banda[bi]
             if geo_estado == "GEOMETRY_ERROR":
                 # Sin evidencia real (círculos Hough + invariantes de grilla) de
                 # que esta banda sea una grilla de burbujas -- pudo caer sobre
@@ -1577,6 +1956,7 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
         "geometry_source_por_banda": geometry_source,
         "row_alignment_confidence_por_banda": row_alignment_confidence_por_banda,
         "row_source_por_banda": row_source_por_banda,
+        "row_index_consensus_por_banda": row_index_consensus_por_banda,
         "resultados": resultados,
     }
 
@@ -1646,7 +2026,33 @@ DESARROLLADO_POR = "Matías Rifo V."
 # (fuera del repo): pasaron de leer casillas de nombre/cédula como si
 # fueran respuestas -- o fallar por completo -- a leer las 80 preguntas
 # con geometry_confidence 0.77-1.00 en la gran mayoría de bandas.
-OMR_ENGINE_VERSION = "4.1.1"
+#
+# v4.2.0 (TRIPLE CHECK DE ÍNDICE DE FILA, SHADOW MODE): refuerza el error más
+# peligroso del OMR -- una respuesta bien leída pero asignada al número de
+# pregunta equivocado (ROW_INDEX_SHIFT) -- con dos sensores geométricos
+# independientes más, además del ROW LATTICE (sensor 1, sin cambios):
+# SENSOR 2 (`omr_calcular_consenso_fase_global`) compara el y0 de cada banda
+# contra la mediana leave-one-out de sus 3 hermanas (consenso robusto, tolera
+# 1 banda corrida sobre 4 sin que esa banda arrastre el veredicto de las
+# otras); SENSOR 3 (`omr_number_lattice_shift_hypothesis`) evalúa hipótesis
+# de shift entero directamente contra el lattice de burbujas YA resuelto, en
+# vez de estimar un origen propio para la franja de números como el sensor
+# v4.1 (evita reproducir el falso positivo histórico del dígito "1": acá un
+# número ausente o espurio nunca mueve el voto de una hipótesis en más de 1,
+# y esa evidencia sola nunca alcanza el margen exigido). `omr_consenso_indice_fila`
+# combina las tres señales sin que NUMBER (siempre auxiliar) pueda vetar un
+# acuerdo entre ROW y GLOBAL, ni fuerte ni débil. Corre en SHADOW MODE por
+# defecto (`ROW_INDEX_CONSENSUS_VETO_HABILITADO=False`): se calcula y se
+# expone siempre en diagnóstico (`row_index_consensus_por_banda`), pero no
+# cambia una sola respuesta ni geometry_confidence mientras el flag siga
+# apagado -- mismo criterio que NUMBER_LATTICE_CROSSCHECK_HABILITADO, no se
+# habilita un veto nuevo sin haberlo medido primero contra fotos reales
+# variadas. Validado: geometry_confidence_por_banda y las 44/64 respuestas
+# confiables de hoja_uso_exclusivo.jpg/hoja_calibracion.png quedan
+# BIT A BIT idénticas a v4.1.1 (shadow mode confirmado sin efecto), y 300+
+# pruebas de ruido puro sintético sobre el sensor NUMBER sin un solo shift
+# falso.
+OMR_ENGINE_VERSION = "4.2.0"
 
 st.markdown("""
 <style>
@@ -2373,6 +2779,7 @@ def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_re
             "geometry_source_por_banda": salida.get("geometry_source_por_banda", []),
             "row_alignment_confidence_por_banda": salida.get("row_alignment_confidence_por_banda", []),
             "row_source_por_banda": salida.get("row_source_por_banda", []),
+            "row_index_consensus_por_banda": salida.get("row_index_consensus_por_banda", []),
             "n_geometry_error": sum(1 for m in metodo_por_pregunta if m == "revisar_geometria"),
             "n_geometry_warning": sum(1 for r in resultados if r.get("geometry_state") == "GEOMETRY_WARNING"),
             "n_answers_omr": n_answers_omr,
