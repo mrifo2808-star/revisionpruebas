@@ -157,6 +157,84 @@ TEMPLATE_PROFILE = {
 }
 OMR_MAX_BANDAS = TEMPLATE_PROFILE["n_bloques_max"]
 
+# ─── Perfiles de plantilla (modelo de hoja de respuestas) ─────────────────
+# Todo lo de arriba (TEMPLATE_PROFILE, OMR_N_FILAS_POR_BLOQUE, OMR_LETRAS y el
+# motor completo -- localizar tabla, bandas por 20 filas x 5 columnas, row
+# lattice, etc.) sigue siendo EXCLUSIVAMENTE el perfil histórico "PAES_80_V1":
+# ninguna de esas funciones cambia de comportamiento ni de firma. Un segundo
+# modelo de hoja con una estructura física distinta (columnas desiguales,
+# cajas separadas con su propio recuadro, 4 alternativas en vez de 5, una
+# pregunta de desarrollo sin burbujas) NO se fuerza por ese mismo pipeline --
+# normalizarlo a la misma matemática de "columnas de N filas parejas" sería,
+# en la práctica, adivinar una geometría que la hoja física no tiene (ver
+# razonamiento fail-closed en el docstring del motor OMR más arriba). En vez
+# de eso, cada perfil adicional declara su propio layout explícito (qué
+# pregunta parte en qué fila de qué caja) y trae su propio lector dedicado
+# -- ver DIA_LECTURA_1M_LAYOUT / omr_analizar_imagen_dia_lectura_1m más abajo,
+# en la sección "MOTOR OMR -- MODELO DIA_LECTURA_1M_V1".
+DIA_LECTURA_1M_LAYOUT = (
+    # Cada columna de la hoja es una tupla de "cajas" (recuadros impresos por
+    # separado). Cada caja: número de la primera pregunta que contiene,
+    # cuántas filas CON burbujas trae, y si inmediatamente después de esas
+    # filas viene una pregunta "de desarrollo" (sin burbujas, no calificable
+    # por OMR) -- en esta plantilla, solo la caja A de la columna 1 la trae
+    # (pregunta 6).
+    ({"inicio": 1, "n_filas": 5, "desarrollo_al_final": True},
+     {"inicio": 7, "n_filas": 7, "desarrollo_al_final": False}),
+    ({"inicio": 14, "n_filas": 5, "desarrollo_al_final": False},
+     {"inicio": 19, "n_filas": 6, "desarrollo_al_final": False}),
+    ({"inicio": 25, "n_filas": 5, "desarrollo_al_final": False},
+     {"inicio": 30, "n_filas": 6, "desarrollo_al_final": False}),
+)
+
+
+def _preguntas_desarrollo(layout):
+    """Números de pregunta "de desarrollo" (sin burbujas, no calificables por
+    OMR) que declara un layout de cajas -- se derivan del layout en vez de
+    hardcodear el número suelto en otro lugar, para que quede trazable de
+    dónde sale."""
+    out = []
+    for columna in layout:
+        for caja in columna:
+            if caja["desarrollo_al_final"]:
+                out.append(caja["inicio"] + caja["n_filas"])
+    return sorted(out)
+
+
+def _n_preguntas_layout(layout):
+    """Total de preguntas (con y sin burbujas) que cubre un layout de cajas."""
+    total = 0
+    for columna in layout:
+        for caja in columna:
+            total += caja["n_filas"] + (1 if caja["desarrollo_al_final"] else 0)
+    return total
+
+
+TEMPLATE_PROFILES = {
+    # Perfil histórico -- comportamiento 100% igual al que existía antes de
+    # que existiera el concepto de "perfil múltiple" (mismos datos que
+    # TEMPLATE_PROFILE, solo envueltos con los campos que necesita el
+    # selector de la UI y el resto del flujo genérico entre perfiles).
+    "PAES_80_V1": {
+        **TEMPLATE_PROFILE,
+        "nombre_visible": "Plantilla estándar (A-E, 20 preguntas por columna)",
+        "letras": OMR_LETRAS,
+        "n_preguntas_default": TEMPLATE_PROFILE["n_max"],
+        "preguntas_desarrollo": [],
+        "layout": None,  # geometría genérica (motor de arriba), no cajas explícitas
+    },
+    "DIA_LECTURA_1M_V1": {
+        "id": "DIA_LECTURA_1M_V1",
+        "nombre_visible": "DIA — Monitoreo Intermedio 2026 — Lectura I medio",
+        "letras": ["A", "B", "C", "D"],
+        "n_max": _n_preguntas_layout(DIA_LECTURA_1M_LAYOUT),
+        "n_preguntas_default": _n_preguntas_layout(DIA_LECTURA_1M_LAYOUT),
+        "preguntas_desarrollo": _preguntas_desarrollo(DIA_LECTURA_1M_LAYOUT),
+        "layout": DIA_LECTURA_1M_LAYOUT,
+    },
+}
+TEMPLATE_PROFILE_DEFAULT_ID = "PAES_80_V1"
+
 
 class OMRError(Exception):
     """Fallo irrecuperable de una etapa del pipeline OMR — la hoja queda sin
@@ -1964,6 +2042,449 @@ def omr_analizar_imagen(img_bgr, es_recorte, max_bandas=OMR_MAX_BANDAS, n_pregun
         "resultados": resultados,
     }
 
+# ═══════════════ MOTOR OMR -- MODELO "DIA_LECTURA_1M_V1" ═════════════════
+# Lector dedicado del segundo modelo de hoja soportado (ver TEMPLATE_PROFILES
+# / DIA_LECTURA_1M_LAYOUT más arriba). A propósito NO reutiliza
+# omr_detectar_bloque_respuestas / omr_detectar_header_y_bandas /
+# omr_ajustar_grilla de arriba: esas funciones asumen una única tabla
+# RESPUESTAS con encabezado y bandas de columnas de 20 filas x 5 alternativas
+# parejas -- la hoja DIA tiene una estructura física distinta (3 columnas,
+# cada una partida en 2 CAJAS con su propio recuadro y su propia cantidad de
+# filas, 4 alternativas, una fila sin burbujas). Forzarla por el pipeline
+# genérico de arriba significaría adivinar una geometría que la hoja no
+# tiene -- acá la geometría de cada caja (cuántas filas tiene, qué pregunta
+# parte en qué fila) se declara explícitamente en DIA_LECTURA_1M_LAYOUT y
+# este lector solo tiene que ENCONTRAR, dentro de esa estructura ya conocida,
+# los recuadros reales impresos y sus burbujas Hough -- nunca "reparte" un
+# ancho o alto a ojo como hace el fallback UNIFORM_FALLBACK/
+# GEOMETRIC_BAND_FALLBACK del motor genérico (ese fallback existe ahí porque
+# la tabla de 20 filas ya viene validada como región completa antes de caer a
+# él; acá no hay esa misma garantía previa, así que no se replica el mismo
+# margen de confianza: una caja sin evidencia real manda TODAS sus preguntas
+# a revisión manual, punto).
+#
+# Calibrado y verificado (spot-check manual pregunta por pregunta) contra
+# tests/data/omr/hoja_dia_lectura_1medio.jpg -- ver test_omr_dia_lectura.py.
+# Es la ÚNICA foto real disponible para este modelo todavía: mismo riesgo
+# residual que el resto del motor OMR (ver docs/CIERRE_2026-08-11.md,
+# "Dataset OMR real todavía limitado"), agravado acá por tratarse de un
+# layout nuevo -- conviene sumar más fotos reales antes de confiar en este
+# lector para calificar alumnos reales sin revisión.
+
+OMR_DIA_ANCHO_REF = 1000  # ancho de referencia para detectar cajas/burbujas -- mismo
+                           # principio que OMR_ANCHO_REF_PAGINA: se detecta a esta escala
+                           # fija y se mide oscuridad siempre sobre la foto a resolución
+                           # completa (ver omr_analizar_imagen_dia_lectura_1m).
+OMR_DIA_FRACCION_ETIQUETA = 0.28  # fracción izquierda de cada caja ocupada por el número
+                                    # de pregunta impreso (recuadro oscuro) -- se recorta
+                                    # ANTES de correr Hough para que esa zona nunca compita
+                                    # como si fuera una burbuja/columna real (sin este
+                                    # recorte, las esquinas redondeadas del recuadro del
+                                    # número producen falsos círculos que arrastran el
+                                    # centro de la columna "A" hacia la etiqueta, midiendo
+                                    # oscuridad sobre tinta que no es una burbuja).
+                                    # Calibrado contra hoja_dia_lectura_1medio.jpg: el
+                                    # número ocupa ~20-22% del ancho de la caja y la
+                                    # burbuja A real empieza ~36-37%; 0.28 queda cómodo
+                                    # entre ambos.
+OMR_DIA_HOUGH_PARAM1 = 60
+OMR_DIA_HOUGH_PARAM2 = 22
+OMR_DIA_N_ALTERNATIVAS = 4
+
+# Umbrales propios de este perfil -- más estrictos que OMR_THRESHOLDS
+# (motor genérico) en HIGH_CONFIDENCE_MARGIN puntualmente. Motivo medido, no
+# preventivo: cada caja de esta hoja tiene 20-28 muestras para su baseline/
+# peak (contra ~100 de una banda del motor genérico, 20 filas x 5 letras),
+# mucho menos evidencia para promediar el ruido. Contra
+# hoja_dia_lectura_1medio.jpg se encontró un caso real (columna A, una
+# marca de lápiz clara a simple vista pero de baja cobertura de área dentro
+# del círculo -- un checkmark liviano, no un relleno sólido) que con
+# HIGH_CONFIDENCE_MARGIN=0.30 (el del motor genérico) alcanzaba
+# alta_confianza con la letra INCORRECTA -- un confident_wrong real, no
+# hipotético. Subir el margen a 0.45 baja esa fila (y otras 2-3 igual de
+# ajustadas) a confianza_media (queda "dudosa", con su recorte, para
+# confirmar a simple vista) en vez de aceptarla ciega. Mismo criterio que el
+# resto del motor: ante la duda de si el margen alcanza, se prefiere menos
+# cobertura automática a arriesgar una respuesta mal leída con confianza alta.
+OMR_DIA_THRESHOLDS = dict(OMR_THRESHOLDS)
+OMR_DIA_THRESHOLDS["HIGH_CONFIDENCE_MARGIN"] = 0.45
+
+
+def _omr_dia_clusters_por_gap(values, gap_min):
+    """Agrupa valores 1D en clusters separados por huecos >= gap_min (mismo
+    principio que _omr_cluster_1d_ordenado del motor genérico, pero sin
+    depender de un k objetivo fijo de antemano -- acá el número de clusters
+    reales es justo lo que hay que descubrir, para poder exigir después un
+    piso de evidencia mínima por cluster y descartar los espurios)."""
+    values = np.sort(np.asarray(values, dtype=np.float64))
+    if len(values) == 0:
+        return []
+    clusters = [[values[0]]]
+    for v in values[1:]:
+        if v - clusters[-1][-1] >= gap_min:
+            clusters.append([v])
+        else:
+            clusters[-1].append(v)
+    return clusters
+
+
+def _omr_dia_detectar_cajas(gray):
+    """
+    Ubica los 6 recuadros de la hoja DIA (3 columnas x 2 cajas, ver
+    DIA_LECTURA_1M_LAYOUT) por contorno: cada caja tiene un borde rectangular
+    real impreso, más sólido/relleno que cualquier otro elemento del cuerpo
+    de la hoja. Devuelve una lista de 3 tuplas ((xA0,yA0,xA1,yA1),
+    (xB0,yB0,xB1,yB1)) -- una por columna, de izquierda a derecha, caja A
+    antes que caja B -- o None si no logra aislar con confianza razonable una
+    estructura de 3 columnas x 2 cajas (fail-closed: mejor no leer nada que
+    adivinar cuál caja es cuál).
+
+    El cierre morfológico tiende a fusionar cada caja A con su caja B vecina
+    (el hueco real entre ambas es angosto) en un contorno "columna completa"
+    -- eso NO es un bug a evitar acá, es la señal que separa las 3 columnas
+    entre sí. Dentro de cada columna, la caja real A y la caja real B se
+    recuperan como los 2 contornos de MENOR altura (la fusión siempre produce
+    el contorno más alto de los 3 candidatos de esa columna); se verifica
+    además que casi no se superpongan verticalmente entre sí, para no
+    confundir un par real con dos contornos internos espurios."""
+    h, w = gray.shape
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 35, 15)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    page_area = h * w
+    candidatos = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < page_area * 0.01 or area > page_area * 0.5:
+            continue
+        x, y, cw, ch = cv2.boundingRect(c)
+        fill = area / max(cw * ch, 1)
+        aspect = ch / max(cw, 1e-6)
+        # cada caja apila varias filas de burbujas (más alta que ancha o
+        # cuadrada) y su contorno, una vez cerrado, queda bien relleno (borde
+        # + contenido interior denso -- no un anillo delgado de texto suelto).
+        if fill > 0.25 and 0.4 < aspect < 4.0:
+            candidatos.append((x, y, x + cw, y + ch))
+    if len(candidatos) < 6:
+        return None
+
+    candidatos.sort(key=lambda b: b[0])
+    clusters, cur = [], [candidatos[0]]
+    for b in candidatos[1:]:
+        if b[0] - cur[-1][0] > w * 0.15:
+            clusters.append(cur)
+            cur = [b]
+        else:
+            cur.append(b)
+    clusters.append(cur)
+    if len(clusters) != 3:
+        return None
+
+    columnas = []
+    for cl in clusters:
+        cl_ordenados = sorted(cl, key=lambda b: (b[3] - b[1]))
+        if len(cl_ordenados) < 2:
+            return None
+        boxA, boxB = cl_ordenados[0], cl_ordenados[1]
+        inter = max(0, min(boxA[3], boxB[3]) - max(boxA[1], boxB[1]))
+        min_alto = min(boxA[3] - boxA[1], boxB[3] - boxB[1])
+        if min_alto <= 0 or inter / min_alto > 0.15:
+            return None  # no son dos cajas separadas -- no se adivina cuál es cuál
+        if boxA[1] > boxB[1]:
+            boxA, boxB = boxB, boxA
+        columnas.append((boxA, boxB))
+    return columnas
+
+
+def _omr_dia_leer_caja(gray_full_res, box, n_filas, n_alt=OMR_DIA_N_ALTERNATIVAS):
+    """
+    Ajusta la grilla de burbujas de UNA caja (box=(x0,y0,x1,y1) en la imagen
+    de resolución completa) y mide la oscuridad de sus n_filas x n_alt
+    burbujas. Devuelve un dict con "ok"=False (fail-closed, ninguna pregunta
+    de esta caja puede darse por confiable) si no hay evidencia geométrica
+    real -- Hough insuficiente o clusters irregulares -- o "ok"=True junto
+    con "resultados" (lista de n_filas dicts, mismo formato que devuelve
+    omr_clasificar_pregunta del motor genérico, que se reutiliza tal cual) y
+    la geometría ajustada (coordenadas LOCALES a la caja, ya sin la etiqueta)
+    para poder recortar preguntas dudosas después."""
+    x0, y0, x1, y1 = [int(v) for v in box]
+    sub_full = gray_full_res[y0:y1, x0:x1]
+    bh, bw_full = sub_full.shape
+    if bh < 10 or bw_full < 10:
+        return {"ok": False, "motivo": "caja_demasiado_chica"}
+    corte = int(bw_full * OMR_DIA_FRACCION_ETIQUETA)
+    sub = sub_full[:, corte:]
+    blur = cv2.medianBlur(sub, 3)
+    r_guess = max(3, bw_full // 22)
+    circles = cv2.HoughCircles(
+        blur, cv2.HOUGH_GRADIENT, dp=1, minDist=max(4, r_guess),
+        param1=OMR_DIA_HOUGH_PARAM1, param2=OMR_DIA_HOUGH_PARAM2,
+        minRadius=max(2, int(r_guess * 0.6)), maxRadius=int(r_guess * 1.8),
+    )
+    esperado = n_alt * n_filas
+    if circles is None or circles.shape[1] < max(esperado * 0.4, 6):
+        return {"ok": False, "motivo": "hough_insuficiente",
+                "n_circulos": 0 if circles is None else int(circles.shape[1])}
+    pts = circles[0]
+
+    xclusters = [c for c in _omr_dia_clusters_por_gap(pts[:, 0], r_guess * 1.5)
+                 if len(c) >= max(2, n_filas * 0.5)]
+    yclusters = [c for c in _omr_dia_clusters_por_gap(pts[:, 1], r_guess * 1.5)
+                 if len(c) >= 2]
+    if len(xclusters) != n_alt or len(yclusters) != n_filas:
+        return {"ok": False, "motivo": "clusters_no_calzan",
+                "n_x": len(xclusters), "n_y": len(yclusters)}
+
+    x_centers = np.array([np.mean(c) for c in xclusters])
+    y_centers = np.array([np.mean(c) for c in yclusters])
+    radio = float(np.median(pts[:, 2])) * 0.9
+
+    dx, dy = np.diff(x_centers), np.diff(y_centers)
+    cv_x = float(dx.std() / max(dx.mean(), 1e-6))
+    cv_y = float(dy.std() / max(dy.mean(), 1e-6))
+    # mismo piso que _omr_validar_invariantes_banda del motor genérico
+    # (spacing_horizontal/vertical_irregular): un layout impreso uniforme no
+    # debería mostrar tanta variación entre burbujas/filas consecutivas --
+    # si la muestra, alguno de los clusters no es una fila/columna real.
+    if cv_x > 0.35 or cv_y > 0.35:
+        return {"ok": False, "motivo": "spacing_irregular", "cv_x": round(cv_x, 3), "cv_y": round(cv_y, 3)}
+
+    letras = OMR_LETRAS[:n_alt]
+    filas_scores = []
+    for cy in y_centers:
+        fila = {letras[i]: _omr_oscuridad_celda(sub, cx, cy, radio) for i, cx in enumerate(x_centers)}
+        filas_scores.append(fila)
+    vals = np.array([v for f in filas_scores for v in f.values()])
+    baseline = float(np.percentile(vals, 15))
+    peak = float(np.percentile(vals, 97))
+
+    resultados = [omr_clasificar_pregunta(f, baseline, peak, umbrales=OMR_DIA_THRESHOLDS) for f in filas_scores]
+    return {
+        "ok": True,
+        "resultados": resultados,
+        "x_centers": x_centers, "y_centers": y_centers, "radio": radio,
+        "corte_etiqueta": corte, "cv_x": round(cv_x, 3), "cv_y": round(cv_y, 3),
+    }
+
+
+def omr_analizar_imagen_dia_lectura_1m(img_bgr, es_recorte=False):
+    """
+    Punto de entrada del lector dedicado al modelo "DIA_LECTURA_1M_V1" (ver
+    DIA_LECTURA_1M_LAYOUT). A diferencia de omr_analizar_imagen (plantilla
+    PAES_80_V1) no localiza un único bloque "RESPUESTAS" con header propio:
+    la detección de cajas (_omr_dia_detectar_cajas) ya funciona directo sobre
+    la hoja completa O sobre un recorte que solo muestre el bloque de
+    respuestas -- ambos casos se resuelven con el mismo contorno de
+    recuadros, así que `es_recorte` se acepta por paridad de interfaz con el
+    motor genérico pero hoy no cambia el comportamiento.
+
+    Sigue el mismo principio de "detectar a escala de referencia, medir a
+    resolución completa" que omr_analizar_imagen: las cajas y las burbujas se
+    ubican sobre una copia reescalada a OMR_DIA_ANCHO_REF, y esas coordenadas
+    se escalan de vuelta a la resolución original antes de medir oscuridad
+    (que SIEMPRE usa la foto completa, nunca la copia de detección).
+
+    Devuelve un dict con "resultados" (lista de 35 dicts en orden P1..P35,
+    mismo formato base que usa el resto del pipeline: letra/status/
+    omr_confidence) y "cajas_info" (metadata/geometría por caja, para poder
+    recortar preguntas dudosas después). Las preguntas de desarrollo (ver
+    DIA_LECTURA_1M_LAYOUT) quedan con status "desarrollo" y letra None -- no
+    es una lectura fallida, es una pregunta sin burbujas que el OMR jamás
+    debe calificar.
+
+    Lanza OMRError si no logra ubicar las 6 cajas (3 columnas x 2) con
+    confianza -- la hoja completa queda sin resolver para completar a mano,
+    igual que el motor genérico."""
+    img_det, escala = _omr_escalar_para_deteccion(img_bgr, OMR_DIA_ANCHO_REF)
+    gray_det = cv2.cvtColor(img_det, cv2.COLOR_BGR2GRAY)
+    columnas_det = _omr_dia_detectar_cajas(gray_det)
+    if columnas_det is None:
+        raise OMRError("No se pudo localizar la estructura de 3 columnas x 2 cajas de la hoja DIA "
+                        "(revisa que las 6 cajas del bloque de respuestas estén completas y visibles en la foto).")
+
+    inv = 1.0 / escala
+    gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    resultados = []
+    cajas_info = []
+    for col_idx, (caja_a, caja_b) in enumerate(columnas_det):
+        layout_col = DIA_LECTURA_1M_LAYOUT[col_idx]
+        for caja_det, caja_layout in zip((caja_a, caja_b), layout_col):
+            box_full = tuple(v * inv for v in caja_det)
+            n_filas = caja_layout["n_filas"]
+            info = _omr_dia_leer_caja(gray_full, box_full, n_filas)
+            info["box"] = box_full
+            info["inicio"] = caja_layout["inicio"]
+            info["desarrollo_al_final"] = caja_layout["desarrollo_al_final"]
+            cajas_info.append(info)
+
+            if info["ok"]:
+                resultados.extend(info["resultados"])
+            else:
+                # Sin evidencia geométrica real en esta caja puntual -- fail
+                # closed: TODAS sus preguntas quedan para revisión manual,
+                # nunca se reparte el espacio "a ojo" (ver nota al inicio de
+                # esta sección sobre por qué acá no se replica el mismo
+                # margen de confianza que el fallback del motor genérico).
+                for _ in range(n_filas):
+                    resultados.append({"letra": None, "status": "geometry_error", "omr_confidence": 0.0})
+
+            if caja_layout["desarrollo_al_final"]:
+                resultados.append({"letra": None, "status": "desarrollo", "omr_confidence": None})
+
+    return {
+        "resultados": resultados,
+        "cajas_info": cajas_info,
+        "img_bgr_original": img_bgr,
+        "escala_deteccion": escala,
+    }
+
+
+def omr_recortar_pregunta_dia(img_bgr, cajas_info, num_pregunta, escala: int = 1):
+    """Recorta la fila completa (4 burbujas + número) de una pregunta puntual
+    de la hoja DIA, sobre la imagen a resolución completa, para mostrarla en
+    la UI de corrección manual -- equivalente a omr_recortar_pregunta del
+    motor genérico, pero ubicando la fila a partir de `cajas_info` (una caja
+    por entrada, con su propio "inicio"/n_filas) en vez de asumir bandas de
+    ancho parejo. Devuelve None si la pregunta no tiene un recorte real que
+    mostrar (caja sin geometría válida, o pregunta de desarrollo sin
+    burbujas)."""
+    for info in cajas_info:
+        if not info.get("ok"):
+            continue
+        n_filas = len(info["y_centers"])
+        rango_ini = info["inicio"]
+        rango_fin = rango_ini + n_filas - 1
+        if rango_ini <= num_pregunta <= rango_fin:
+            idx_fila = num_pregunta - rango_ini
+            x0, y0, x1, y1 = info["box"]
+            cy = info["y_centers"][idx_fila]
+            radio = info["radio"]
+            corte = info["corte_etiqueta"]
+            crop_x0, crop_x1 = x0 + corte - radio * 3.2, x1
+            crop_y0, crop_y1 = y0 + cy - radio * 2.4, y0 + cy + radio * 2.4
+            h, w = img_bgr.shape[:2]
+            cx0, cx1 = max(0, int(crop_x0)), min(w, int(crop_x1))
+            cy0, cy1 = max(0, int(crop_y0)), min(h, int(crop_y1))
+            crop = img_bgr[cy0:cy1, cx0:cx1]
+            if escala != 1 and crop.size:
+                crop = cv2.resize(crop, (crop.shape[1] * escala, crop.shape[0] * escala),
+                                   interpolation=cv2.INTER_NEAREST)
+            return crop
+    return None
+
+
+def omr_dia_analizar_hoja(datos_bytes: bytes, n: int) -> dict:
+    """Equivalente a analizar_hoja_omr (motor genérico) para el modelo
+    DIA_LECTURA_1M_V1: decodifica la imagen a resolución original y corre
+    omr_analizar_imagen_dia_lectura_1m. `n` se acepta por paridad de interfaz
+    (siempre 35 para este perfil) y se usa solo para validar -- si por algún
+    motivo el layout entregó menos de n resultados (no debería pasar nunca,
+    el layout es fijo), se trata como hoja no legible en vez de arriesgar un
+    índice fuera de rango más adelante en el pipeline."""
+    img_pil = abrir_imagen_corregida(datos_bytes)
+    if img_pil is None:
+        raise OMRError("La imagen no se pudo decodificar.")
+    img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    salida = omr_analizar_imagen_dia_lectura_1m(img_bgr)
+    resultados = salida["resultados"]
+    if len(resultados) < n:
+        raise OMRError(f"El layout DIA_LECTURA_1M_V1 solo entregó {len(resultados)} de las {n} preguntas esperadas.")
+    salida["resultados"] = resultados[:n]
+    return salida
+
+
+def _omr_dia_construir_resultado(salida: dict, nombre: str, n: int) -> dict:
+    """Equivalente a _construir_resultado_omr (motor genérico) para el
+    modelo DIA_LECTURA_1M_V1. Sin identificación automática ni arbitraje de
+    IA (fuera de alcance de esta primera versión del perfil -- mismo
+    comportamiento que el modo "solo respuestas" del motor genérico: nombre/
+    curso/fecha quedan en blanco, se completan a mano en Revisar y corregir).
+    Lo que el OMR no resuelve con confianza queda "dudosa" para revisión
+    manual. Las preguntas de desarrollo (status "desarrollo") NUNCA entran a
+    "dudosas" -- no hay ninguna burbuja que revisar ahí; son de corrección
+    manual fuera de esta app por diseño (ver DIA_LECTURA_1M_LAYOUT)."""
+    resultados = salida["resultados"]
+    img_bgr = salida["img_bgr_original"]
+    cajas_info = salida["cajas_info"]
+    umbral_blanco = OMR_THRESHOLDS["BLANK_REVIEW_MARGIN"]
+
+    respuestas, dudosas, metodo_por_pregunta, confianza_por_pregunta = [], [], [], []
+    for i, r in enumerate(resultados):
+        q = i + 1
+        letra, status = r["letra"], r["status"]
+        if status == "desarrollo":
+            metodo = "desarrollo"
+        elif status == "alta_confianza":
+            metodo = "confiable"
+        elif status == "confianza_media":
+            metodo = "revisar_media"
+            dudosas.append(q)
+        elif status == "sin_marca" and r["omr_confidence"] <= umbral_blanco:
+            metodo = "blanco"
+        elif status == "geometry_error":
+            metodo = "revisar_geometria"
+            letra = None
+            dudosas.append(q)
+        else:
+            # ambiguo, doble_marca, o "sin_marca" con tinta suficiente para
+            # sospechar una marca muy débil -> el motor no adivina, nunca hay
+            # arbitraje de IA en este perfil todavía (ver docstring).
+            metodo = "revisar_dudoso"
+            letra = None
+            dudosas.append(q)
+        respuestas.append(letra)
+        metodo_por_pregunta.append(metodo)
+        confianza_por_pregunta.append(r.get("omr_confidence") or 0.0)
+
+    crops_dudosas = {}
+    for q in dudosas:
+        try:
+            crop_bgr = omr_recortar_pregunta_dia(img_bgr, cajas_info, q, escala=5)
+            if crop_bgr is not None and crop_bgr.size:
+                ok, buf = cv2.imencode(".jpg", crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    crops_dudosas[str(q)] = buf.tobytes()
+        except Exception:
+            pass  # sin recorte disponible para esta dudosa puntual; igual queda en la lista para corregir a mano
+
+    n_answers_omr = sum(1 for m in metodo_por_pregunta if m in ("confiable", "revisar_media", "blanco"))
+    n_answers_unresolved = sum(1 for m in metodo_por_pregunta if m in ("revisar_dudoso", "revisar_geometria"))
+
+    res = {
+        "respuestas": respuestas,
+        "dudosas": sorted(set(dudosas)),
+        "archivo": nombre,
+        "n_preguntas": n,
+        "solo_respuestas": True,  # mismo motivo que el docstring: sin cabecera automática en este perfil aún
+        "apellido_paterno": "", "apellido_materno": "", "nombres": "", "cedula": "", "nro_folleto": "",
+        "omr_crops_dudosas": crops_dudosas,
+        "omr_meta": {
+            "usado": True,
+            "modelo": "DIA_LECTURA_1M_V1",
+            "n_bandas": 6,  # 3 columnas x 2 cajas -- por paridad informativa con el motor genérico
+            "metodo_por_pregunta": metodo_por_pregunta,
+            "confianza_por_pregunta": confianza_por_pregunta,
+            "n_confiable": sum(1 for m in metodo_por_pregunta if m in ("confiable", "blanco")),
+            "n_dudosas": len(dudosas),
+            "n_desarrollo": sum(1 for m in metodo_por_pregunta if m == "desarrollo"),
+            "n_geometry_error": sum(1 for m in metodo_por_pregunta if m == "revisar_geometria"),
+            "n_geometry_warning": 0,
+            "n_answers_omr": n_answers_omr,
+            "n_answers_ai": 0,
+            "n_answers_manual": 0,
+            "n_answers_unresolved": n_answers_unresolved,
+            "n_api_calls_answer_arbitration": 0,
+            "ia_arbitraje_habilitado": False,
+            "n_api_calls_identification": 0,
+        },
+    }
+    evaluar_sospecha(res)
+    return res
+
 # ═══════════════════════ fin motor OMR ═══════════════════════════════════
 
 
@@ -2118,6 +2639,7 @@ def safe_key(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '_', s)
 
 for k, v in {
+    "modelo_prueba": TEMPLATE_PROFILE_DEFAULT_ID,  # ver TEMPLATE_PROFILES -- qué modelo de hoja se está usando
     "n_preguntas": 80,
     "resultados": {},
     "correcciones": {},      # {arch: {str(num_p): letra}}
@@ -2132,7 +2654,18 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-OPCIONES = ["A", "B", "C", "D", "E", "—"]
+OPCIONES = ["A", "B", "C", "D", "E", "—"]  # perfil PAES_80_V1 (default) -- para otros perfiles ver
+                                             # opciones_pauta_activas(), que respeta perfil["letras"]
+
+
+def opciones_pauta_activas() -> list:
+    """Letras válidas + "—" para el perfil de hoja actualmente seleccionado
+    (ver TEMPLATE_PROFILES) -- reemplaza a OPCIONES en los selectores de la
+    UI que dependen del alfabeto (dudosas, importar rápido) para que un
+    perfil de 4 alternativas (p.ej. DIA_LECTURA_1M_V1) no ofrezca "E" como
+    opción válida."""
+    perfil = TEMPLATE_PROFILES.get(st.session_state.get("modelo_prueba"), TEMPLATE_PROFILES[TEMPLATE_PROFILE_DEFAULT_ID])
+    return list(perfil["letras"]) + ["—"]
 
 
 def prompt_dinamico(n: int, num_imagenes: int = 1, solo_respuestas: bool = False) -> str:
@@ -2632,16 +3165,21 @@ def _crop_dudosa_b64_jpeg(body_bgr, y_centers, band_x_centers, radio, idx_local,
     return buf.tobytes() if ok else None
 
 
-def _fallback_no_leido(nombre: str, n: int, solo_respuestas: bool, motivo: str) -> dict:
+def _fallback_no_leido(nombre: str, n: int, solo_respuestas: bool, motivo: str,
+                        preguntas_desarrollo: tuple = ()) -> dict:
     """Resultado cuando el motor OMR no pudo leer una hoja, sea por lo que sea
     (tabla no localizable, imagen ilegible, o cualquier fallo inesperado más
     adelante en el pipeline). A propósito NO se cae a IA para inventar
     respuestas — nunca se le pide a Claude que lea burbujas. Todas las
     preguntas quedan sin resolver, para completar a mano o reprocesar esta
-    foto puntual en modo "Solo IA" desde el sidebar si se prefiere."""
+    foto puntual en modo "Solo IA" desde el sidebar si se prefiere (motor
+    genérico solamente -- ver procesar_imagen_hibrido). `preguntas_desarrollo`
+    (perfiles con capa de preguntas de desarrollo, ver TEMPLATE_PROFILES)
+    se excluye de "dudosas": no hay ninguna burbuja que revisar ahí."""
+    dudosas = [q for q in range(1, n + 1) if q not in preguntas_desarrollo]
     return {
         "respuestas": [None] * n,
-        "dudosas": list(range(1, n + 1)),
+        "dudosas": dudosas,
         "archivo": nombre, "n_preguntas": n, "solo_respuestas": solo_respuestas,
         "apellido_paterno": "", "apellido_materno": "", "nombres": "", "cedula": "", "nro_folleto": "",
         "omr_meta": {"usado": False, "motivo_fallback": motivo},
@@ -2654,7 +3192,8 @@ def _fallback_no_leido(nombre: str, n: int, solo_respuestas: bool, motivo: str) 
 
 
 def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str, n: int,
-                             solo_respuestas: bool = False, ia_arbitraje_habilitado: bool = False) -> dict:
+                             solo_respuestas: bool = False, ia_arbitraje_habilitado: bool = False,
+                             perfil_id: str = TEMPLATE_PROFILE_DEFAULT_ID) -> dict:
     """
     Las respuestas SIEMPRE se determinan primero con el motor OMR (visión
     clásica) -- OMR es la fuente PRIMARIA, punto. Claude Vision solo entra en
@@ -2671,11 +3210,34 @@ def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str,
     Lo que ni el OMR ni ese apoyo puntual de IA logran determinar queda
     marcado como "dudosa" con un recorte ampliado adjunto para que la persona
     lo revise y corrija a mano en **Revisar y corregir**.
+
+    `perfil_id` selecciona QUÉ motor de lectura corre (ver TEMPLATE_PROFILES):
+    el perfil histórico PAES_80_V1 sigue exactamente el camino de siempre
+    (analizar_hoja_omr / _construir_resultado_omr, con identificación y
+    arbitraje de IA); un perfil con "layout" propio (hoy solo
+    DIA_LECTURA_1M_V1) usa su lector dedicado (omr_dia_analizar_hoja /
+    _omr_dia_construir_resultado) -- ver el módulo "MOTOR OMR -- MODELO
+    DIA_LECTURA_1M_V1" más arriba para por qué NO comparte el pipeline
+    genérico. Sin identificación automática ni arbitraje de IA todavía en
+    ese camino (ver limitación documentada ahí mismo).
     """
+    perfil = TEMPLATE_PROFILES.get(perfil_id, TEMPLATE_PROFILES[TEMPLATE_PROFILE_DEFAULT_ID])
+    preguntas_desarrollo = tuple(perfil.get("preguntas_desarrollo", ()))
+
+    if perfil.get("layout") is not None:
+        try:
+            salida = omr_dia_analizar_hoja(datos_bytes, n)
+        except Exception as e:
+            return _fallback_no_leido(nombre, n, solo_respuestas, str(e), preguntas_desarrollo)
+        try:
+            return _omr_dia_construir_resultado(salida, nombre, n)
+        except Exception as e:
+            return _fallback_no_leido(nombre, n, solo_respuestas, str(e), preguntas_desarrollo)
+
     try:
         salida = analizar_hoja_omr(datos_bytes, solo_respuestas, n)
     except Exception as e:
-        return _fallback_no_leido(nombre, n, solo_respuestas, str(e))
+        return _fallback_no_leido(nombre, n, solo_respuestas, str(e), preguntas_desarrollo)
 
     try:
         return _construir_resultado_omr(salida, cliente, nombre, n, solo_respuestas, ia_arbitraje_habilitado)
@@ -2683,7 +3245,7 @@ def procesar_imagen_hibrido(cliente, nombre: str, datos_bytes: bytes, mime: str,
         # Cualquier fallo inesperado DESPUÉS de tener la grilla (p.ej. al
         # generar el diagnóstico visual o un recorte) tampoco debe tumbar la
         # hoja con un error crudo: se degrada al mismo resultado "no leído".
-        return _fallback_no_leido(nombre, n, solo_respuestas, str(e))
+        return _fallback_no_leido(nombre, n, solo_respuestas, str(e), preguntas_desarrollo)
 
 
 def _construir_resultado_omr(salida: dict, cliente, nombre: str, n: int, solo_respuestas: bool,
@@ -2900,11 +3462,15 @@ def pauta_desde_df(df: pd.DataFrame) -> list:
 
 # ─── Pauta desde Excel (alternativa de ingreso, además del grid y el pegado
 # rápido) ───────────────────────────────────────────────────────────────
-def generar_plantilla_pauta_excel(n: int) -> bytes:
+def generar_plantilla_pauta_excel(n: int, letras=("A", "B", "C", "D", "E")) -> bytes:
     """Plantilla mínima para completar la pauta fuera de la app: dos
-    columnas (N°, Respuesta), con una lista desplegable A-E en la columna
+    columnas (N°, Respuesta), con una lista desplegable en la columna
     Respuesta para evitar errores de tipeo. Misma estructura de 2 columnas
-    que lee de vuelta `pauta_desde_excel_bytes`."""
+    que lee de vuelta `pauta_desde_excel_bytes`. `letras` por defecto A-E
+    (plantilla histórica, PAES_80_V1) -- perfiles con menos alternativas
+    (p.ej. DIA_LECTURA_1M_V1, A-D) pasan su propio TEMPLATE_PROFILES[...]
+    ["letras"] para que el desplegable no ofrezca una letra que esa hoja no
+    tiene."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Pauta"
@@ -2916,9 +3482,10 @@ def generar_plantilla_pauta_excel(n: int) -> bytes:
         c.alignment = Alignment(horizontal="center")
     for i in range(1, n + 1):
         ws.cell(i + 1, 1, f"P{i}").alignment = Alignment(horizontal="center")
-    dv = DataValidation(type="list", formula1='"A,B,C,D,E"', allow_blank=True,
+    letras_str = ",".join(letras)
+    dv = DataValidation(type="list", formula1=f'"{letras_str}"', allow_blank=True,
                          showErrorMessage=True, errorTitle="Valor inválido",
-                         error="Ingresa solo A, B, C, D o E.")
+                         error=f"Ingresa solo {' , '.join(letras)}.")
     ws.add_data_validation(dv)
     dv.add(f"B2:B{n + 1}")
     ws.column_dimensions["A"].width = 8
@@ -3144,51 +3711,109 @@ def render_revisor_pruebas():
                 "API Key de Anthropic", type="password", placeholder="sk-ant-...")
         curso = st.text_input("Nombre del curso", placeholder="Ej: 3°A — Historia 2026")
         st.markdown("---")
-        st.markdown("**Número de preguntas**")
-        n_prev = st.session_state["n_preguntas"]
         hay_procesadas = bool(st.session_state["resultados"])
-        n_nuevo = st.number_input("Preguntas", min_value=1, max_value=TEMPLATE_PROFILE["n_max"],
-                                   value=n_prev, step=1, label_visibility="collapsed",
-                                   disabled=hay_procesadas)
+
+        st.markdown("**Modelo de prueba**")
+        perfil_ids = list(TEMPLATE_PROFILES.keys())
+        perfil_prev_id = st.session_state["modelo_prueba"]
+        perfil_nuevo_id = st.selectbox(
+            "Modelo de prueba", options=perfil_ids,
+            format_func=lambda pid: TEMPLATE_PROFILES[pid]["nombre_visible"],
+            index=perfil_ids.index(perfil_prev_id) if perfil_prev_id in perfil_ids else 0,
+            label_visibility="collapsed", disabled=hay_procesadas,
+        )
         if hay_procesadas:
-            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este N°. "
-                       "Usa **Limpiar todo** antes de cambiarlo (cambiarlo a medio camino "
-                       "descuadra el puntaje de las hojas ya analizadas).")
-        elif n_nuevo != n_prev:
-            st.session_state["n_preguntas"] = n_nuevo
-            st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
+            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modelo. Usa **Limpiar todo** antes de cambiarlo.")
+        elif perfil_nuevo_id != perfil_prev_id:
+            st.session_state["modelo_prueba"] = perfil_nuevo_id
+            perfil_elegido = TEMPLATE_PROFILES[perfil_nuevo_id]
+            # Cambiar de modelo cambia el N de preguntas y el alfabeto -- la
+            # pauta ya cargada (si la había) queda para un N/alfabeto distinto,
+            # así que se limpia igual que al cambiar N a mano más abajo.
+            st.session_state["n_preguntas"] = perfil_elegido["n_preguntas_default"]
+            st.session_state["pauta_df"] = df_pauta_vacio(perfil_elegido["n_preguntas_default"])
             st.session_state["pauta"] = []
             st.session_state.pop("pauta_excel_hash", None)
             st.session_state.pop("pauta_excel_avisos", None)
             st.session_state.pop("pauta_excel_n_cargadas", None)
+            if perfil_elegido.get("layout") is not None:
+                # Este perfil no tiene un camino 100%-IA propio todavía (ver
+                # "MOTOR OMR -- MODELO DIA_LECTURA_1M_V1") -- el motor OMR
+                # queda forzado, no es un toggle disponible para él.
+                st.session_state["usar_omr"] = True
             st.rerun()
-        st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
+
+        perfil_actual = TEMPLATE_PROFILES[st.session_state["modelo_prueba"]]
+        st.caption(f"📄 {perfil_actual['nombre_visible']}")
         st.markdown("---")
-        st.markdown("**Modo de carga de fotos**")
-        opciones_modo = {
-            "completa": "📄 Hoja completa (recorte automático)",
-            "solo_respuestas": "✂️ Solo bloque RESPUESTAS (ya recortado por ti)",
-        }
-        modo_prev = st.session_state["modo_captura"]
-        modo_nuevo = st.radio(
-            "Modo de carga", options=list(opciones_modo.keys()),
-            format_func=lambda k: opciones_modo[k],
-            index=list(opciones_modo.keys()).index(modo_prev),
-            label_visibility="collapsed", disabled=hay_procesadas,
-        )
-        if hay_procesadas:
-            st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modo. Usa **Limpiar todo** antes de cambiarlo.")
-        elif modo_nuevo != modo_prev:
-            st.session_state["modo_captura"] = modo_nuevo
-            st.rerun()
-        if st.session_state["modo_captura"] == "solo_respuestas":
-            st.caption("✂️ Nombre, RUT y folleto quedan en blanco — se completan a mano.")
+
+        st.markdown("**Número de preguntas**")
+        n_prev = st.session_state["n_preguntas"]
+        if perfil_actual.get("layout") is not None:
+            desc_desarrollo = (f" + {len(perfil_actual['preguntas_desarrollo'])} de desarrollo"
+                                if perfil_actual["preguntas_desarrollo"] else "")
+            st.info(f"📌 Estructura fija de este modelo: **{perfil_actual['n_preguntas_default']} preguntas** "
+                    f"({'/'.join(perfil_actual['letras'])}{desc_desarrollo}) -- no es configurable.")
         else:
-            st.caption("📄 La app recorta e identifica al alumno automáticamente.")
+            n_nuevo = st.number_input("Preguntas", min_value=1, max_value=perfil_actual["n_max"],
+                                       value=n_prev, step=1, label_visibility="collapsed",
+                                       disabled=hay_procesadas)
+            if hay_procesadas:
+                st.caption("🔒 Bloqueado: ya hay hojas procesadas con este N°. "
+                           "Usa **Limpiar todo** antes de cambiarlo (cambiarlo a medio camino "
+                           "descuadra el puntaje de las hojas ya analizadas).")
+            elif n_nuevo != n_prev:
+                st.session_state["n_preguntas"] = n_nuevo
+                st.session_state["pauta_df"] = df_pauta_vacio(n_nuevo)
+                st.session_state["pauta"] = []
+                st.session_state.pop("pauta_excel_hash", None)
+                st.session_state.pop("pauta_excel_avisos", None)
+                st.session_state.pop("pauta_excel_n_cargadas", None)
+                st.rerun()
+            st.caption(f"Configurado para **{st.session_state['n_preguntas']} preguntas**")
+        st.markdown("---")
+        es_perfil_con_layout = perfil_actual.get("layout") is not None
+        if es_perfil_con_layout:
+            # Este perfil no distingue "hoja completa" de "solo respuestas"
+            # (su detector de cajas ya funciona sobre cualquiera de las dos,
+            # ver "MOTOR OMR -- MODELO DIA_LECTURA_1M_V1") ni tiene todavía
+            # identificación automática de nombre/curso/fecha -- se completan
+            # a mano en Revisar y corregir, limitación documentada del
+            # perfil.
+            st.markdown("**Modo de carga de fotos**")
+            st.caption("📄 Sube la hoja completa o solo el bloque de respuestas -- ambos funcionan igual con "
+                       "este modelo. Nombre/curso/fecha no se identifican automáticamente todavía: complétalos "
+                       "a mano en **Revisar y corregir**.")
+        else:
+            st.markdown("**Modo de carga de fotos**")
+            opciones_modo = {
+                "completa": "📄 Hoja completa (recorte automático)",
+                "solo_respuestas": "✂️ Solo bloque RESPUESTAS (ya recortado por ti)",
+            }
+            modo_prev = st.session_state["modo_captura"]
+            modo_nuevo = st.radio(
+                "Modo de carga", options=list(opciones_modo.keys()),
+                format_func=lambda k: opciones_modo[k],
+                index=list(opciones_modo.keys()).index(modo_prev),
+                label_visibility="collapsed", disabled=hay_procesadas,
+            )
+            if hay_procesadas:
+                st.caption("🔒 Bloqueado: ya hay hojas procesadas con este modo. Usa **Limpiar todo** antes de cambiarlo.")
+            elif modo_nuevo != modo_prev:
+                st.session_state["modo_captura"] = modo_nuevo
+                st.rerun()
+            if st.session_state["modo_captura"] == "solo_respuestas":
+                st.caption("✂️ Nombre, RUT y folleto quedan en blanco — se completan a mano.")
+            else:
+                st.caption("📄 La app recorta e identifica al alumno automáticamente.")
         st.markdown("---")
         st.markdown("**Motor de lectura**")
         if not OMR_DISPONIBLE:
             st.caption("🤖 Solo IA (motor OMR no disponible en este entorno).")
+        elif es_perfil_con_layout:
+            st.session_state["usar_omr"] = True
+            st.caption("🔬 Motor OMR (único motor disponible para este modelo -- no tiene todavía un camino "
+                       "100%-IA ni arbitraje de preguntas ambiguas, ver limitación documentada en el motor).")
         else:
             omr_prev = st.session_state["usar_omr"]
             omr_nuevo = st.toggle(
@@ -3255,11 +3880,13 @@ def render_revisor_pruebas():
         col_t, col_i = st.columns([2, 1], gap="large")
 
         with col_i:
+            letras_perfil = perfil_actual["letras"]
+            alfabeto_str = "".join(letras_perfil)
             st.markdown("**Importar rápido**")
             texto_bulk = st.text_area("Importar", height=200, label_visibility="collapsed",
-                placeholder=f"A\nB\nC\n...\no bien: A,B,C,D,E,...\n({n} respuestas)")
+                placeholder=f"{letras_perfil[0]}\n{letras_perfil[1]}\n...\no bien: {','.join(letras_perfil)},...\n({n} respuestas)")
             if st.button("⬇️ Cargar al grid", use_container_width=True):
-                letras = [l.upper() for l in extraer_letras_pauta_rapida(texto_bulk)]
+                letras = [l.upper() for l in extraer_letras_pauta_rapida(texto_bulk) if l.upper() in letras_perfil]
                 if letras:
                     st.session_state["pauta_df"] = pd.DataFrame({
                         "N°":[f"P{i}" for i in range(1,n+1)],
@@ -3268,12 +3895,12 @@ def render_revisor_pruebas():
                     st.success(f"✓ {min(len(letras),n)} respuestas cargadas")
                     st.rerun()
                 else:
-                    st.error("No se encontraron letras A–E válidas.")
+                    st.error(f"No se encontraron letras {alfabeto_str} válidas.")
 
             st.markdown("---")
             st.markdown("**Desde Excel**")
             st.download_button(
-                "📥 Descargar plantilla de pauta", data=generar_plantilla_pauta_excel(n),
+                "📥 Descargar plantilla de pauta", data=generar_plantilla_pauta_excel(n, letras=letras_perfil),
                 file_name=f"plantilla_pauta_{n}preguntas.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True, key="descargar_plantilla_pauta",
@@ -3447,7 +4074,8 @@ def render_revisor_pruebas():
                             res = procesar_imagen_hibrido(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
                                                            solo_respuestas=solo_resp,
                                                            ia_arbitraje_habilitado=st.session_state.get(
-                                                               "ia_arbitraje_habilitado", False))
+                                                               "ia_arbitraje_habilitado", False),
+                                                           perfil_id=st.session_state["modelo_prueba"])
                         else:
                             res = procesar_imagen(cliente, foto["nombre"], foto["bytes"], foto["mime"], n,
                                                    solo_respuestas=solo_resp)
@@ -3607,6 +4235,7 @@ def render_revisor_pruebas():
 
                         # Renderizar en grupos de 6 (menos que antes: ahora cada columna
                         # también lleva el recorte de la fila, así que necesitan más ancho)
+                        opciones_activas = opciones_pauta_activas()
                         CHUNK = 6
                         for chunk_start in range(0, len(dudosas), CHUNK):
                             chunk = dudosas[chunk_start:chunk_start+CHUNK]
@@ -3617,7 +4246,8 @@ def render_revisor_pruebas():
                                 # Leer valor guardado en session_state directamente para evitar blank
                                 widget_key = f"dud_{sk}_{num_p}"
                                 saved_val  = corr_arch.get(str(num_p), resp_orig or "—")
-                                idx_opcion = OPCIONES.index(saved_val) if saved_val in OPCIONES else 5
+                                idx_opcion = (opciones_activas.index(saved_val) if saved_val in opciones_activas
+                                              else len(opciones_activas) - 1)
 
                                 with cols[j]:
                                     crop_bytes = crops_dudosas.get(str(num_p))
@@ -3625,7 +4255,7 @@ def render_revisor_pruebas():
                                         st.image(crop_bytes, width=160)
                                     nueva = st.selectbox(
                                         f"P{num_p}",
-                                        options=OPCIONES,
+                                        options=opciones_activas,
                                         index=idx_opcion,
                                         key=widget_key,
                                     )

@@ -1,0 +1,14 @@
+{
+  "imagen": "hoja_dia_lectura_1medio.jpg",
+  "modelo": "DIA_LECTURA_1M_V1",
+  "n_preguntas": 35,
+  "nota": "Ground truth PARCIAL: solo se rellenaron las preguntas que se verificaron a mano contra recortes ampliados (interpolacion cubica, sin artefactos de compresion) de la foto original -- ver tests/test_omr_dia_lectura.py. Las demas quedan en null a proposito (no es que esten en blanco en la hoja fisica: es que no se verificaron independientemente todavia). Este archivo se usa unicamente para blindar 'confident_wrong=0' en las preguntas SI verificadas, no para medir cobertura total. La pregunta 6 es de desarrollo (sin burbujas, no calificable por OMR) -- no aparece en 'respuestas'.",
+  "respuestas": {
+    "1": "C", "2": "A", "4": "B",
+    "11": "B", "12": "B", "13": "B",
+    "14": "D", "15": "A", "16": "D", "17": "C", "18": "B",
+    "19": "B", "20": "B",
+    "25": "A", "26": "A", "27": "B",
+    "31": "B"
+  }
+}
