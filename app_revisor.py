@@ -4363,9 +4363,12 @@ def render_inicio():
         with col_desc:
             st.markdown("### 📝 Revisor de Hojas de Respuestas")
             st.markdown(
-                "Corrige hojas de respuestas tipo PAES (80 preguntas, 4 bloques, "
-                "alternativas A-E) a partir de fotos: detecta la grilla automáticamente, "
-                "lee las marcas y arma el Excel de resultados."
+                "Corrige hojas de respuestas a partir de fotos: detecta la grilla "
+                "automáticamente, lee las marcas y arma el Excel de resultados. "
+                "Soporta 2 modelos de hoja (elegible dentro de la herramienta, en "
+                "**Modelo de prueba**): la plantilla estándar (80 preguntas, 4 bloques, "
+                "alternativas A-E) y la hoja DIA — Monitoreo Intermedio 2026, Lectura I "
+                "medio (35 preguntas, alternativas A-D)."
             )
             st.markdown('<span class="corr-badge badge-ok">Disponible</span>', unsafe_allow_html=True)
         with col_boton:
