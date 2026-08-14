@@ -2609,6 +2609,22 @@ st.markdown("""
 .badge-null { background:#f3f4f6; color:#6b7280; }
 div[data-testid="stDataEditor"] { font-size:13px; }
 div[data-testid="stFileUploader"] > div { min-height: 120px; }
+/* Tarjetas de la página de Inicio (ver render_inicio): el link "Abrir" de
+   cada herramienta pasa de link de texto chico a botón grande, para que sea
+   obvio dónde hacer clic -- pedido real tras el primer despliegue del
+   selector de modelo de prueba (el link por defecto de st.page_link era
+   apenas más grande que texto normal). */
+div[data-testid="stPageLink"] { margin-top: 10px; }
+div[data-testid="stPageLink"] a {
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    width:100%; padding:18px 20px; border-radius:12px;
+    background:#2563EB; text-decoration:none;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+div[data-testid="stPageLink"] a:hover { background:#1E40AF; transform: translateY(-1px); }
+div[data-testid="stPageLink"] a, div[data-testid="stPageLink"] a * {
+    color:#ffffff !important; font-size:19px; font-weight:700;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -4359,21 +4375,23 @@ def render_inicio():
     st.markdown("---")
 
     with st.container(border=True):
-        col_desc, col_boton = st.columns([3, 1])
-        with col_desc:
-            st.markdown("### 📝 Revisor de Hojas de Respuestas")
-            st.markdown(
-                "Corrige hojas de respuestas a partir de fotos: detecta la grilla "
-                "automáticamente, lee las marcas y arma el Excel de resultados. "
-                "Soporta 2 modelos de hoja (elegible dentro de la herramienta, en "
-                "**Modelo de prueba**): la plantilla estándar (80 preguntas, 4 bloques, "
-                "alternativas A-E) y la hoja DIA — Monitoreo Intermedio 2026, Lectura I "
-                "medio (35 preguntas, alternativas A-D)."
-            )
-            st.markdown('<span class="corr-badge badge-ok">Disponible</span>', unsafe_allow_html=True)
-        with col_boton:
-            st.markdown("")
-            st.page_link(pagina_revisor, label="Abrir →", icon="📝", use_container_width=True)
+        st.markdown("### 📝 Revisor de Hojas de Respuestas")
+        st.markdown(
+            "Corrige hojas de respuestas a partir de fotos: detecta la grilla "
+            "automáticamente, lee las marcas y arma el Excel de resultados. "
+            "Soporta 2 modelos de hoja (elegible dentro de la herramienta, en "
+            "**Modelo de prueba**): la plantilla estándar (80 preguntas, 4 bloques, "
+            "alternativas A-E) y la hoja DIA — Monitoreo Intermedio 2026, Lectura I "
+            "medio (35 preguntas, alternativas A-D)."
+        )
+        st.markdown('<span class="corr-badge badge-ok">Disponible</span>', unsafe_allow_html=True)
+        # Botón grande a ancho completo de la tarjeta (antes vivía apretado en
+        # una columna de 1/4 del ancho, casi del tamaño de un link de texto --
+        # pedido real: que sea obvio y fácil de encontrar/tocar, sobre todo
+        # desde el celular). Estilo grande vía CSS (ver bloque <style> con
+        # div[data-testid="stPageLink"] más arriba en el archivo).
+        st.page_link(pagina_revisor, label="Abrir Revisor de Hojas de Respuestas →", icon="📝",
+                     use_container_width=True)
 
     st.caption("✨ Más herramientas de IA para docentes están en camino.")
 
